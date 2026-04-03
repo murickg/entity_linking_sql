@@ -30,13 +30,15 @@ Strategy:
 3. Use search_columns to find specific columns if needed
 4. When confident, output your final answer
 
-Database: {db_name} (SQLite)
+Database: {db_name} ({platform})
 Available tables: {table_list}
 
 When you are ready to give your final answer, respond with a JSON object (and nothing else) in this exact format:
 {{"tables": ["table1", "table2"], "columns": ["table1.col1", "table1.col2", "table2.col3"]}}
 
-Use the format table_name.column_name for columns. Only include tables and columns that are directly needed to answer the question.\
+Use the format table_name.column_name for columns. For nested fields (BigQuery STRUCT), \
+use dot notation: table.struct_field.nested_field. \
+Only include tables and columns that are directly needed to answer the question.\
 """
 
 TOOLS = [
@@ -148,7 +150,11 @@ def run_agent(
     )
 
     table_list = ", ".join(sorted(index.tables.keys()))
-    system_msg = SYSTEM_PROMPT.format(db_name=index.db_name, table_list=table_list)
+    system_msg = SYSTEM_PROMPT.format(
+        db_name=index.db_name,
+        platform=index.platform.upper(),
+        table_list=table_list,
+    )
 
     user_content = f"Question: {question}"
     if external_knowledge:

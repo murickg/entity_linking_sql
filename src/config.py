@@ -7,7 +7,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SPIDER2_DIR = PROJECT_ROOT / "spider2-lite"
 JSONL_PATH = SPIDER2_DIR / "spider2-lite.jsonl"
 LOCAL_MAP_PATH = PROJECT_ROOT / "local_sqlite" / "local-map.jsonl"
-SQLITE_DDL_DIR = SPIDER2_DIR / "resource" / "databases" / "sqlite"
+DATABASES_DIR = SPIDER2_DIR / "resource" / "databases"
+SQLITE_DDL_DIR = DATABASES_DIR / "sqlite"
+BIGQUERY_DDL_DIR = DATABASES_DIR / "bigquery"
+SNOWFLAKE_DDL_DIR = DATABASES_DIR / "snowflake"
 GOLD_SQL_DIR = SPIDER2_DIR / "evaluation_suite" / "gold" / "sql"
 DOCUMENTS_DIR = SPIDER2_DIR / "resource" / "documents"
 

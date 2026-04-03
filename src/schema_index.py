@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 from rank_bm25 import BM25Okapi
 
-from src.data_loader import load_ddl, load_local_map
+from src.data_loader import load_ddl
 
 
 def tokenize(text: str) -> list[str]:
@@ -21,6 +21,7 @@ class TableInfo:
     name: str
     ddl: str
     columns: list[tuple[str, str]]  # (name, type)
+    description: str = ""
     search_tokens: list[str] = field(default_factory=list)
 
 
@@ -29,6 +30,7 @@ class SchemaIndex:
     """BM25-based search index for a single database's schema."""
 
     db_name: str
+    platform: str = "sqlite"
     tables: dict[str, TableInfo] = field(default_factory=dict)
     _table_bm25: BM25Okapi | None = None
     _table_names: list[str] = field(default_factory=list)
@@ -40,6 +42,9 @@ class SchemaIndex:
         self._table_names = []
         for name, info in self.tables.items():
             tokens = tokenize(name)
+            # Add description tokens for Snowflake tables
+            if info.description:
+                tokens.extend(tokenize(info.description))
             for col_name, col_type in info.columns:
                 tokens.extend(tokenize(col_name))
             info.search_tokens = tokens
@@ -75,7 +80,8 @@ class SchemaIndex:
         for idx, score in ranked:
             name = self._table_names[idx]
             info = self.tables[name]
-            col_names = [c[0] for c in info.columns[:15]]
+            # Show top-level columns only (no dot-paths) for preview
+            col_names = [c[0] for c in info.columns if "." not in c[0]][:15]
             results.append({
                 "table_name": name,
                 "score": round(float(score), 4),
@@ -112,33 +118,28 @@ class SchemaIndex:
         return info.ddl
 
 
-def build_index(db_name: str) -> SchemaIndex:
-    """Build a SchemaIndex for a SQLite database by parsing its DDL.csv."""
-    ddl_data = load_ddl(db_name)
-    index = SchemaIndex(db_name=db_name)
+def build_index(db_name: str, platform: str = "sqlite") -> SchemaIndex:
+    """Build a SchemaIndex for a database by parsing its DDL.csv."""
+    ddl_data = load_ddl(db_name, platform=platform)
+    index = SchemaIndex(db_name=db_name, platform=platform)
     for table_name, table_data in ddl_data.items():
         index.tables[table_name] = TableInfo(
             name=table_name,
             ddl=table_data["ddl"],
             columns=table_data["columns"],
+            description=table_data.get("description", ""),
         )
     index._build_table_index()
     return index
 
 
-# Cache of built indices
-_index_cache: dict[str, SchemaIndex] = {}
+# Cache of built indices: key = (db_name, platform)
+_index_cache: dict[tuple[str, str], SchemaIndex] = {}
 
 
-def get_index(db_name: str) -> SchemaIndex:
+def get_index(db_name: str, platform: str = "sqlite") -> SchemaIndex:
     """Get or build a cached SchemaIndex for a database."""
-    if db_name not in _index_cache:
-        _index_cache[db_name] = build_index(db_name)
-    return _index_cache[db_name]
-
-
-def resolve_db_name(instance_id: str, local_map: dict[str, str] | None = None) -> str | None:
-    """Resolve instance_id to a database name."""
-    if local_map is None:
-        local_map = load_local_map()
-    return local_map.get(instance_id)
+    key = (db_name, platform)
+    if key not in _index_cache:
+        _index_cache[key] = build_index(db_name, platform)
+    return _index_cache[key]

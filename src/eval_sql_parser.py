@@ -1,8 +1,18 @@
+import re
+
 import sqlglot
 from sqlglot import exp
 
 
-def extract_tables_columns(sql: str) -> tuple[set[str], set[str]]:
+# Map our platform names to sqlglot dialect names
+DIALECT_MAP = {
+    "sqlite": "sqlite",
+    "bigquery": "bigquery",
+    "snowflake": "snowflake",
+}
+
+
+def extract_tables_columns(sql: str, platform: str = "sqlite") -> tuple[set[str], set[str]]:
     """Extract table names and column references from a SQL query.
 
     Returns: (set of table names, set of table.column references)
@@ -11,13 +21,18 @@ def extract_tables_columns(sql: str) -> tuple[set[str], set[str]]:
     columns = set()
     cte_names = set()
     table_aliases = {}  # alias -> real table name
+    unnest_aliases = set()  # aliases created by UNNEST (BigQuery)
+
+    dialect = DIALECT_MAP.get(platform, platform)
+
+    # Strip DECLARE statements (BigQuery-specific, not handled by sqlglot)
+    cleaned_sql = _strip_declares(sql)
 
     try:
-        parsed = sqlglot.parse(sql, read="sqlite")
+        parsed = sqlglot.parse(cleaned_sql, read=dialect)
     except sqlglot.errors.ParseError:
-        # Fallback: try without dialect
         try:
-            parsed = sqlglot.parse(sql)
+            parsed = sqlglot.parse(cleaned_sql)
         except sqlglot.errors.ParseError:
             return set(), set()
 
@@ -31,16 +46,30 @@ def extract_tables_columns(sql: str) -> tuple[set[str], set[str]]:
             if alias:
                 cte_names.add(alias.lower())
 
+        # Collect UNNEST aliases (BigQuery)
+        if platform == "bigquery":
+            for unnest in statement.find_all(exp.Unnest):
+                parent = unnest.parent
+                if hasattr(parent, 'alias') and parent.alias:
+                    unnest_aliases.add(parent.alias.lower())
+
         # Collect real table names and their aliases
         for table in statement.find_all(exp.Table):
             name = table.name
             if not name:
                 continue
             name_lower = name.lower()
+
             # Skip CTE references
             if name_lower in cte_names:
                 continue
+
+            # For BigQuery: strip date suffixes and wildcards
+            if platform == "bigquery":
+                name_lower = _normalize_bq_table(name_lower)
+
             tables.add(name_lower)
+
             # Track alias -> table mapping
             alias = table.alias
             if alias:
@@ -54,22 +83,49 @@ def extract_tables_columns(sql: str) -> tuple[set[str], set[str]]:
                 continue
             col_name_lower = col_name.lower()
 
-            # Determine the table this column belongs to
+            # For Snowflake: strip quotes
+            col_name_lower = col_name_lower.strip('"')
+
             table_ref = col.table
             if table_ref:
-                table_ref_lower = table_ref.lower()
-                # Resolve alias to real table name
+                table_ref_lower = table_ref.lower().strip('"')
                 real_table = table_aliases.get(table_ref_lower)
                 if real_table:
                     columns.add(f"{real_table}.{col_name_lower}")
+                elif table_ref_lower in unnest_aliases:
+                    # UNNEST alias — column is a nested field
+                    columns.add(f"{table_ref_lower}.{col_name_lower}")
                 else:
-                    # Could be a CTE reference or unresolved
                     columns.add(f"{table_ref_lower}.{col_name_lower}")
             else:
-                # Unqualified column - try to attribute later or leave unqualified
                 columns.add(col_name_lower)
 
     return tables, columns
+
+
+def _strip_declares(sql: str) -> str:
+    """Remove DECLARE statements from BigQuery SQL."""
+    lines = sql.split('\n')
+    filtered = []
+    for line in lines:
+        stripped = line.strip().upper()
+        if stripped.startswith('DECLARE '):
+            continue
+        filtered.append(line)
+    return '\n'.join(filtered)
+
+
+def _normalize_bq_table(name: str) -> str:
+    """Normalize BigQuery table names: strip date suffixes, wildcards."""
+    # Strip wildcard: ga_sessions_* -> ga_sessions
+    name = name.rstrip('*').rstrip('_')
+    # Strip full date suffix: ga_sessions_20170101 -> ga_sessions
+    name = re.sub(r'_\d{8}$', '', name)
+    # Strip partial date suffix (YYYYMM or YYYY): ga_sessions_201707, ga_sessions_2017
+    name = re.sub(r'_\d{4,6}$', '', name)
+    # Clean up trailing underscores
+    name = name.rstrip('_')
+    return name
 
 
 def normalize_columns(columns: set[str], tables: set[str]) -> set[str]:
