@@ -2,11 +2,13 @@ import argparse
 import json
 import sys
 
+from src.config import SQLITE_DB_DIR
 from src.data_loader import (
     detect_platform,
     load_instances,
     load_local_map,
     load_external_knowledge,
+    load_ddl,
     resolve_db_name,
 )
 from src.schema_index import get_index
@@ -14,7 +16,19 @@ from src.agent import run_agent
 from src.evaluate import run_evaluation
 
 
-def run_single(instance_id: str):
+def _resolve_sqlite_path(db_name: str):
+    """Find the .sqlite file for a database name."""
+    path = SQLITE_DB_DIR / f"{db_name}.sqlite"
+    if path.exists():
+        return path
+    # Try case-insensitive
+    for f in SQLITE_DB_DIR.iterdir():
+        if f.suffix == ".sqlite" and f.stem.lower() == db_name.lower():
+            return f
+    return None
+
+
+def run_single(instance_id: str, use_autolink: bool = False):
     """Run agent on a single instance and print results."""
     instances = load_instances(platform=None)
     local_map = load_local_map()
@@ -33,11 +47,8 @@ def run_single(instance_id: str):
     print(f"Instance: {instance_id}")
     print(f"Platform: {platform}")
     print(f"Database: {db_name}")
+    print(f"Agent: {'AutoLink' if use_autolink else 'BM25 baseline'}")
     print(f"Question: {instance['question']}")
-    print()
-
-    index = get_index(db_name, platform=platform)
-    print(f"Schema tables ({len(index.tables)}): {sorted(index.tables.keys())}")
     print()
 
     ext_knowledge = None
@@ -47,14 +58,49 @@ def run_single(instance_id: str):
             print(f"External knowledge loaded: {instance['external_knowledge']} "
                   f"({len(ext_knowledge)} chars)")
 
-    print("Running agent...")
-    result = run_agent(
-        question=instance["question"],
-        index=index,
-        external_knowledge=ext_knowledge,
-    )
+    if use_autolink and platform == "sqlite":
+        from src.autolink_agent import run_autolink_agent
+        from src.sqlite_executor import SQLiteExecutor
+        from src.vector_store import get_vector_store
 
-    print(f"\nAgent completed in {result['iterations']} iterations, "
+        sqlite_path = _resolve_sqlite_path(db_name)
+        if not sqlite_path:
+            print(f"SQLite file not found for '{db_name}'.")
+            sys.exit(1)
+
+        ddl_data = load_ddl(db_name, platform="sqlite")
+        executor = SQLiteExecutor(sqlite_path)
+        vector_store = get_vector_store(db_name, ddl_data, sqlite_path)
+
+        print(f"Schema tables ({len(ddl_data)}): {sorted(ddl_data.keys())}")
+        print(f"Vector store: {len(vector_store.documents)} column documents")
+        print()
+        print("Running AutoLink agent...")
+
+        result = run_autolink_agent(
+            question=instance["question"],
+            db_name=db_name,
+            ddl_data=ddl_data,
+            executor=executor,
+            vector_store=vector_store,
+            external_knowledge=ext_knowledge,
+        )
+    else:
+        if use_autolink and platform != "sqlite":
+            print("Warning: --autolink only supported for SQLite, falling back to baseline.")
+
+        index = get_index(db_name, platform=platform)
+        print(f"Schema tables ({len(index.tables)}): {sorted(index.tables.keys())}")
+        print()
+        print("Running BM25 agent...")
+
+        result = run_agent(
+            question=instance["question"],
+            index=index,
+            external_knowledge=ext_knowledge,
+        )
+
+    print(f"\nAgent completed in {result.get('iterations', 0)} iterations, "
           f"{len(result.get('tool_calls', []))} tool calls")
     print(f"\nPredicted tables: {result['tables']}")
     print(f"Predicted columns: {result['columns']}")
@@ -65,7 +111,7 @@ def run_single(instance_id: str):
     if result.get("tool_calls"):
         print(f"\nTool call history:")
         for tc in result["tool_calls"]:
-            print(f"  - {tc['name']}({json.dumps(tc['args'])})")
+            print(f"  - {tc['name']}({json.dumps(tc['args'], ensure_ascii=False)[:100]})")
 
 
 def main():
@@ -78,13 +124,20 @@ def main():
                         default=None, help="Filter to a specific platform (default: all)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Max number of instances to evaluate")
+    parser.add_argument("--autolink", action="store_true",
+                        help="Use AutoLink agent (SQLite only)")
 
     args = parser.parse_args()
 
     if args.instance:
-        run_single(args.instance)
+        run_single(args.instance, use_autolink=args.autolink)
     elif args.evaluate:
-        run_evaluation(platform=args.platform, dry_run=args.dry_run, limit=args.limit)
+        run_evaluation(
+            platform=args.platform,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            use_autolink=args.autolink,
+        )
     else:
         parser.print_help()
 

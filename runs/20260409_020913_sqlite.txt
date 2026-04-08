@@ -1,0 +1,42 @@
+Command: /Users/muradgamzatov/PycharmProjects/entity_linking_sql/src/run.py --evaluate --platform sqlite
+Started: 2026-04-09T02:09:13.452308
+======================================================================
+
+Found 24 instances with gold SQL (platform=sqlite)
+
+[1/24] local003 (sqlite)  tables P=0.67 R=0.67 F1=0.67  cols P=0.00 R=0.00 F1=0.00  time=16.83s
+[2/24] local004 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=0.17 R=0.11 F1=0.13  time=14.3s
+[3/24] local008 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.58 F1=0.74  time=12.37s
+[4/24] local017 (sqlite)  tables P=0.50 R=1.00 F1=0.67  cols P=0.00 R=0.00 F1=0.00  time=13.16s
+[5/24] local019 (sqlite)  tables P=1.00 R=0.43 F1=0.60  cols P=0.89 R=0.29 F1=0.43  time=15.07s
+[6/24] local022 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=0.87 R=0.62 F1=0.72  time=16.3s
+[7/24] local023 (sqlite)  tables P=0.67 R=1.00 F1=0.80  cols P=0.57 R=0.67 F1=0.62  time=18.44s
+[8/24] local029 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.69 F1=0.82  time=10.52s
+[9/24] local038 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=1.00 F1=1.00  time=17.95s
+[10/24] local039 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=0.24 R=1.00 F1=0.38  time=17.27s
+[11/24] local058 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.57 F1=0.73  time=16.64s
+[12/24] local066 (sqlite)  tables P=0.50 R=1.00 F1=0.67  cols P=0.14 R=0.12 F1=0.13  time=20.28s
+[13/24] local065 (sqlite)  tables P=0.50 R=1.00 F1=0.67  cols P=0.50 R=0.36 F1=0.42  time=11.73s
+[14/24] local075 (sqlite)  tables P=0.67 R=1.00 F1=0.80  cols P=0.50 R=0.42 F1=0.45  time=15.57s
+[15/24] local078 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.56 F1=0.71  time=10.42s
+[16/24] local099 (sqlite)  tables P=0.75 R=1.00 F1=0.86  cols P=0.86 R=0.46 F1=0.60  time=15.04s
+[17/24] local131 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.33 F1=0.50  time=9.85s
+[18/24] local163 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.33 F1=0.50  time=7.01s
+[19/24] local197 (sqlite)  tables P=0.50 R=1.00 F1=0.67  cols P=0.33 R=0.20 F1=0.25  time=11.21s
+[20/24] local199 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=1.00 R=0.36 F1=0.53  time=10.8s
+[21/24] local210 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=0.75 R=0.60 F1=0.67  time=13.52s
+[22/24] local219 (sqlite)  tables P=0.00 R=0.00 F1=0.00  cols P=0.00 R=0.00 F1=0.00  time=18.0s
+[23/24] local301 (sqlite)  tables P=1.00 R=1.00 F1=1.00  cols P=0.00 R=0.00 F1=0.00  time=10.14s
+[24/24] local309 (sqlite)  tables P=0.40 R=0.50 F1=0.44  cols P=0.33 R=0.24 F1=0.28  time=20.26s
+
+======================================================================
+EVALUATION SUMMARY (24 instances)
+======================================================================
+Tables  - P: 0.7979  R: 0.8998  F1: 0.8265
+Columns - P: 0.5894  R: 0.3966  F1: 0.4423
+Avg iterations: 6.1, Avg time: 14.3s
+
+JSON results saved to /Users/muradgamzatov/PycharmProjects/entity_linking_sql/results/evaluation_results_sqlite.json
+Run log saved to /Users/muradgamzatov/PycharmProjects/entity_linking_sql/runs/20260409_020913_sqlite.txt
+
+Finished: 2026-04-09T02:14:56.314075

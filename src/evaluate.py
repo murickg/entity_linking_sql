@@ -4,12 +4,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from src.config import PROJECT_ROOT, RESULTS_DIR
+from src.config import PROJECT_ROOT, RESULTS_DIR, SQLITE_DB_DIR
 from src.data_loader import (
     detect_platform,
     get_instances_with_gold_sql,
     load_gold_sql,
     load_external_knowledge,
+    load_ddl,
     load_local_map,
     resolve_db_name,
 )
@@ -94,7 +95,18 @@ def evaluate_instance_dry(instance: dict, local_map: dict) -> dict | None:
     }
 
 
-def evaluate_instance(instance: dict, local_map: dict) -> dict | None:
+def _resolve_sqlite_path(db_name: str):
+    """Find the .sqlite file for a database name."""
+    path = SQLITE_DB_DIR / f"{db_name}.sqlite"
+    if path.exists():
+        return path
+    for f in SQLITE_DB_DIR.iterdir():
+        if f.suffix == ".sqlite" and f.stem.lower() == db_name.lower():
+            return f
+    return None
+
+
+def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = False) -> dict | None:
     """Full evaluation: run agent and compare with ground truth."""
     instance_id = instance["instance_id"]
     gold_sql = load_gold_sql(instance_id)
@@ -110,9 +122,6 @@ def evaluate_instance(instance: dict, local_map: dict) -> dict | None:
     gt_tables, gt_columns = extract_tables_columns(gold_sql, platform=platform)
     gt_columns = normalize_columns(gt_columns, gt_tables)
 
-    # Build index
-    index = get_index(db_name, platform=platform)
-
     # Load external knowledge
     ext_knowledge = None
     if instance.get("external_knowledge"):
@@ -120,11 +129,36 @@ def evaluate_instance(instance: dict, local_map: dict) -> dict | None:
 
     # Run agent
     start_time = time.time()
-    result = run_agent(
-        question=instance["question"],
-        index=index,
-        external_knowledge=ext_knowledge,
-    )
+
+    if use_autolink and platform == "sqlite":
+        from src.autolink_agent import run_autolink_agent
+        from src.sqlite_executor import SQLiteExecutor
+        from src.vector_store import get_vector_store
+
+        sqlite_path = _resolve_sqlite_path(db_name)
+        if not sqlite_path:
+            return None
+
+        ddl_data = load_ddl(db_name, platform="sqlite")
+        executor = SQLiteExecutor(sqlite_path)
+        vector_store = get_vector_store(db_name, ddl_data, sqlite_path)
+
+        result = run_autolink_agent(
+            question=instance["question"],
+            db_name=db_name,
+            ddl_data=ddl_data,
+            executor=executor,
+            vector_store=vector_store,
+            external_knowledge=ext_knowledge,
+        )
+    else:
+        index = get_index(db_name, platform=platform)
+        result = run_agent(
+            question=instance["question"],
+            index=index,
+            external_knowledge=ext_knowledge,
+        )
+
     elapsed = time.time() - start_time
 
     # Normalize predictions
@@ -153,13 +187,14 @@ def evaluate_instance(instance: dict, local_map: dict) -> dict | None:
     }
 
 
-def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: int | None = None) -> dict:
+def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: int | None = None, use_autolink: bool = False) -> dict:
     """Run evaluation on instances with gold SQL.
 
     Args:
         platform: Filter to 'sqlite', 'bigquery', 'snowflake', or None for all.
         dry_run: If True, only parse gold SQL without LLM calls.
         limit: Max number of instances to evaluate.
+        use_autolink: If True, use AutoLink agent for SQLite instances.
     """
     command = " ".join(sys.argv)
     logger = RunLogger(command=command, platform=platform, dry_run=dry_run)
@@ -182,7 +217,7 @@ def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: in
             if dry_run:
                 result = evaluate_instance_dry(inst, local_map)
             else:
-                result = evaluate_instance(inst, local_map)
+                result = evaluate_instance(inst, local_map, use_autolink=use_autolink)
         except Exception as e:
             logger.log(f"[{i+1}/{len(instances)}] {instance_id} ({inst_platform})... ERROR: {e}")
             results.append({

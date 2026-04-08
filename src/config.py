@@ -22,7 +22,17 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MODEL = "anthropic/claude-sonnet-4"
 
-# Agent settings
+# Agent settings (baseline BM25)
 MAX_AGENT_ITERATIONS = 10
 SEARCH_TOP_K_TABLES = 10
 SEARCH_TOP_K_COLUMNS = 20
+
+# AutoLink settings
+SQLITE_DB_DIR = PROJECT_ROOT / "local_sqlite"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_CACHE_DIR = PROJECT_ROOT / "cache" / "embeddings"
+VS_INITIAL_TOP_N = 20
+VS_RETRIEVE_TOP_M = 3
+SQLITE_TIMEOUT = 5.0
+SQLITE_MAX_ROWS = 50
+AUTOLINK_MAX_TURNS = 10
