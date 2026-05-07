@@ -6,6 +6,7 @@ import numpy as np
 
 from src.config import EMBEDDING_MODEL, EMBEDDING_CACHE_DIR, VS_INITIAL_TOP_N, VS_RETRIEVE_TOP_M
 from src.sqlite_executor import SQLiteExecutor
+from src.column_describer import generate_all_descriptions
 
 
 @dataclass
@@ -15,6 +16,12 @@ class ColumnDocument:
     col_type: str
     sample_values: list[str] = field(default_factory=list)
     description: str = ""
+    # Profiling stats (from AT&T paper)
+    distinct_count: int | None = None
+    null_count: int | None = None
+    total_count: int | None = None
+    min_value: str | None = None
+    max_value: str | None = None
 
     def to_mschema(self) -> str:
         """Format as M-Schema string for embedding and display."""
@@ -23,6 +30,12 @@ class ColumnDocument:
             parts.append(f"Type: {self.col_type}")
         if self.description:
             parts.append(f"Description: {self.description}")
+        # Profiling stats — enrich embedding
+        if self.distinct_count is not None and self.total_count:
+            null_pct = round(100 * (self.null_count or 0) / self.total_count) if self.total_count else 0
+            parts.append(f"Stats: {self.distinct_count} distinct / {self.total_count} rows, {null_pct}% null")
+        if self.min_value is not None and self.max_value is not None:
+            parts.append(f"Range: [{self.min_value} .. {self.max_value}]")
         if self.sample_values:
             vals = ", ".join(f'"{v}"' for v in self.sample_values[:5])
             parts.append(f"Values: [{vals}]")
@@ -47,28 +60,93 @@ class VectorStore:
         return self._model
 
     def build(self, ddl_data: dict[str, dict], sqlite_path: Path) -> None:
-        """Build column documents from DDL metadata + sample values from SQLite."""
+        """Build column documents from DDL metadata + profiling stats + sample values."""
         executor = SQLiteExecutor(sqlite_path)
         self.documents = []
 
+        # Pre-fetch row counts per table
+        table_counts: dict[str, int] = {}
+        for table_name in ddl_data:
+            result = executor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
+            try:
+                lines = result.strip().split("\n")
+                if len(lines) >= 3:
+                    table_counts[table_name] = int(lines[-1].strip().split("|")[0].strip())
+            except (ValueError, IndexError):
+                pass
+
         for table_name, table_data in ddl_data.items():
             columns = table_data.get("columns", [])
+            total_count = table_counts.get(table_name)
+
             for col_name, col_type in columns:
                 # Skip dot-path nested columns (BQ only)
                 if "." in col_name:
                     continue
                 sample_values = executor.get_sample_values(table_name, col_name, limit=10)
+
+                # Collect profiling stats
+                distinct_count = None
+                null_count = None
+                min_value = None
+                max_value = None
+
+                profile_sql = (
+                    f'SELECT COUNT(DISTINCT "{col_name}"), '
+                    f'SUM(CASE WHEN "{col_name}" IS NULL THEN 1 ELSE 0 END), '
+                    f'MIN("{col_name}"), MAX("{col_name}") '
+                    f'FROM "{table_name}"'
+                )
+                profile_result = executor.execute(profile_sql)
+                if "[ERROR" not in profile_result:
+                    try:
+                        lines = profile_result.strip().split("\n")
+                        if len(lines) >= 3:
+                            vals = [v.strip() for v in lines[-1].split("|")]
+                            if len(vals) >= 4:
+                                distinct_count = int(vals[0]) if vals[0] else None
+                                null_count = int(vals[1]) if vals[1] else None
+                                min_val = vals[2].strip()
+                                max_val = vals[3].strip()
+                                # Truncate long values
+                                min_value = min_val[:40] if min_val else None
+                                max_value = max_val[:40] if max_val else None
+                    except (ValueError, IndexError):
+                        pass
+
                 doc = ColumnDocument(
                     table_name=table_name,
                     column_name=col_name,
                     col_type=col_type,
                     sample_values=sample_values,
                     description=table_data.get("description", ""),
+                    distinct_count=distinct_count,
+                    null_count=null_count,
+                    total_count=total_count,
+                    min_value=min_value,
+                    max_value=max_value,
                 )
                 self.documents.append(doc)
 
+        # Generate LLM descriptions (cached per db)
+        self._apply_llm_descriptions()
+
         # Build embeddings
         self._build_embeddings()
+
+    def _apply_llm_descriptions(self) -> None:
+        """Generate and apply LLM descriptions to column documents."""
+        if not self.documents:
+            return
+        descriptions = generate_all_descriptions(self.db_name, self.documents)
+        applied = 0
+        for doc in self.documents:
+            key = f"{doc.table_name}.{doc.column_name}"
+            if key in descriptions:
+                doc.description = descriptions[key]
+                applied += 1
+        if applied:
+            print(f"  Applied {applied}/{len(self.documents)} LLM descriptions")
 
     def _build_embeddings(self) -> None:
         """Encode all column documents and cache."""

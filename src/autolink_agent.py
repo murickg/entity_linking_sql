@@ -2,6 +2,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
+import sqlglot
+from sqlglot import exp
 from openai import OpenAI
 
 from src.config import (
@@ -138,10 +140,13 @@ You do NOT see the full database schema. Instead, you explore it iteratively usi
 
 4. **add_schema** — Add table.column pairs to the linked schema. Format: "table.col1; table.col2"
 
-5. **remove_schema** — Remove table.column pairs from the linked schema if they are not needed.
+5. **match_literal** — Search for a literal value (e.g. "Fresno", "EUR", "2024") across all text \
+columns. Returns which columns contain that value. Great for finding the right filter column.
+
+6. **remove_schema** — Remove table.column pairs from the linked schema if they are not needed.
    Format: "table.col1; table.col2". Use "table" (without column) to remove entire table.
 
-6. **stop_action** — Finish the schema linking process. Use this when you believe the linked \
+7. **stop_action** — Finish the schema linking process. Use this when you believe the linked \
 schema contains all necessary tables and columns.
 
 ## Strategy
@@ -150,9 +155,12 @@ schema contains all necessary tables and columns.
 3. Use add_schema to add elements you are confident about
 4. Use explore_schema to inspect table structures (PRAGMA table_info)
 5. Use retrieve_schema to find semantically related columns you might be missing
-6. Use verify_schema to test a draft SQL — errors reveal missing elements
-7. Use remove_schema to prune elements that turned out to be irrelevant
-8. Use stop_action when confident the schema is complete
+6. Use verify_schema to write a draft SQL query — it will auto-extract all referenced tables and \
+columns into the linked schema, AND execute the query to verify correctness. THIS IS THE MOST \
+POWERFUL TOOL — write SQL that uses all the columns you think are needed!
+7. Use match_literal if the question mentions specific values (names, codes, statuses)
+8. Use remove_schema to prune elements that turned out to be irrelevant
+9. Use stop_action when confident the schema is complete
 
 IMPORTANT: Be selective. Only add tables/columns that are actually needed for the query. \
 Quality over quantity — precision matters as much as recall.
@@ -247,6 +255,25 @@ AUTOLINK_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "match_literal",
+            "description": "Search for a literal value across all text columns in the database. "
+                           "Returns which columns contain the value. "
+                           "Use when the question mentions specific names, codes, or statuses.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "literal": {
+                        "type": "string",
+                        "description": "The literal value to search for, e.g. 'Fresno', 'EUR', 'delivered'",
+                    }
+                },
+                "required": ["literal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "remove_schema",
             "description": "Remove table.column pairs from the linked schema that are not needed. "
                            "Use 'table' (without column) to remove an entire table.",
@@ -278,6 +305,133 @@ AUTOLINK_TOOLS = [
 
 
 # ---------------------------------------------------------------------------
+# SQL → schema extraction (task alignment from AT&T paper)
+# ---------------------------------------------------------------------------
+
+def _extract_schema_from_sql(sql: str, known_tables: set[str]) -> list[str]:
+    """Parse a draft SQL and extract table.column pairs that exist in the DB.
+
+    Returns list of 'table.column' strings for auto-addition to LinkedSchema.
+    """
+    try:
+        parsed = sqlglot.parse(sql, read="sqlite")
+    except sqlglot.errors.ParseError:
+        return []
+
+    table_aliases: dict[str, str] = {}  # alias -> real table
+    cte_names: set[str] = set()
+    results: list[str] = []
+
+    for stmt in parsed:
+        if stmt is None:
+            continue
+
+        # Collect CTE names
+        for cte in stmt.find_all(exp.CTE):
+            if cte.alias:
+                cte_names.add(cte.alias.lower())
+
+        # Collect tables + aliases
+        for table in stmt.find_all(exp.Table):
+            name = table.name
+            if not name:
+                continue
+            name_lower = name.lower()
+            if name_lower in cte_names:
+                continue
+            # Resolve to known table (case-insensitive)
+            resolved = None
+            for kt in known_tables:
+                if kt.lower() == name_lower:
+                    resolved = kt
+                    break
+            if resolved:
+                alias = table.alias
+                if alias:
+                    table_aliases[alias.lower()] = resolved
+                table_aliases[name_lower] = resolved
+
+        # Collect columns
+        for col in stmt.find_all(exp.Column):
+            col_name = col.name
+            if not col_name:
+                continue
+            table_ref = col.table
+            if table_ref:
+                real_table = table_aliases.get(table_ref.lower())
+                if real_table:
+                    results.append(f"{real_table}.{col_name}")
+            # No table ref — skip (ambiguous)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Literal matching (from AT&T paper)
+# ---------------------------------------------------------------------------
+
+def _find_literal_in_db(literal: str, executor: SQLiteExecutor, ddl_data: dict) -> str:
+    """Search for a literal value across all text columns in the database.
+
+    Returns formatted results showing which columns contain the literal.
+    """
+    matches = []
+    literal_escaped = literal.replace("'", "''")
+
+    for table_name, table_info in ddl_data.items():
+        columns = table_info.get("columns", [])
+        text_cols = [
+            col_name for col_name, col_type in columns
+            if "." not in col_name  # skip nested
+            and col_type.upper() in ("TEXT", "VARCHAR", "CHAR", "NVARCHAR", "")
+        ]
+        if not text_cols:
+            continue
+
+        # Build a single query checking all text columns at once
+        conditions = " OR ".join(
+            f'"{c}" LIKE \'%{literal_escaped}%\'' for c in text_cols
+        )
+        count_exprs = ", ".join(
+            f'SUM(CASE WHEN "{c}" LIKE \'%{literal_escaped}%\' THEN 1 ELSE 0 END) AS "{c}"'
+            for c in text_cols
+        )
+        sql = f'SELECT {count_exprs} FROM "{table_name}" WHERE {conditions} LIMIT 1'
+        result = executor.execute(sql)
+
+        # Parse result to find which columns matched
+        if "[ERROR" in result or "0 rows" in result:
+            continue
+        # Result has column headers + one row of counts
+        for col_name in text_cols:
+            # Simple check: look for non-zero count
+            # The formatted result contains column names and values
+            if f"{col_name}" in result:
+                # Re-query individual column for accuracy
+                check_sql = (
+                    f'SELECT COUNT(*) AS cnt FROM "{table_name}" '
+                    f'WHERE "{col_name}" LIKE \'%{literal_escaped}%\''
+                )
+                check_result = executor.execute(check_sql)
+                if "[ERROR" not in check_result and "0 rows" not in check_result:
+                    # Extract count
+                    lines = check_result.strip().split("\n")
+                    if len(lines) >= 3:
+                        cnt_str = lines[-1].strip()
+                        try:
+                            cnt = int(cnt_str.split("|")[0].strip())
+                            if cnt > 0:
+                                matches.append(f"{table_name}.{col_name} ({cnt} matches)")
+                        except (ValueError, IndexError):
+                            if cnt_str and cnt_str != "0":
+                                matches.append(f"{table_name}.{col_name}")
+
+    if matches:
+        return f"Literal '{literal}' found in:\n" + "\n".join(f"  - {m}" for m in matches)
+    return f"Literal '{literal}' not found in any text column."
+
+
+# ---------------------------------------------------------------------------
 # Tool execution
 # ---------------------------------------------------------------------------
 
@@ -287,6 +441,7 @@ def execute_tool(
     executor: SQLiteExecutor,
     vector_store: VectorStore,
     linked_schema: LinkedSchema,
+    ddl_data: dict | None = None,
 ) -> str:
     """Execute an AutoLink tool call and return observation."""
     if name == "explore_schema":
@@ -302,7 +457,28 @@ def execute_tool(
         return "Retrieved columns:\n" + "\n".join(lines)
 
     elif name == "verify_schema":
-        return executor.execute(args["sql_query"])
+        sql = args["sql_query"]
+        exec_result = executor.execute(sql)
+
+        # Auto-extract schema from the draft SQL (task alignment)
+        known_tables = set(ddl_data.keys()) if ddl_data else set()
+        extracted = _extract_schema_from_sql(sql, known_tables)
+        auto_added = []
+        if extracted:
+            specs = "; ".join(extracted)
+            add_msg = linked_schema.add(specs)
+            for spec in extracted:
+                if "." in spec:
+                    t, c = spec.split(".", 1)
+                    vector_store.mark_excluded(t, c)
+            auto_added_items = [s for s in extracted if "." in s]
+            if auto_added_items:
+                auto_added = auto_added_items
+
+        result = exec_result
+        if auto_added:
+            result += f"\n\n[Auto-linked from SQL: {', '.join(auto_added[:15])}]"
+        return result
 
     elif name == "add_schema":
         result = linked_schema.add(args["schemas"])
@@ -313,6 +489,11 @@ def execute_tool(
                 table, col = spec.split(".", 1)
                 vector_store.mark_excluded(table.strip(), col.strip())
         return result
+
+    elif name == "match_literal":
+        if ddl_data is None:
+            return "[ERROR: No DDL data available]"
+        return _find_literal_in_db(args["literal"], executor, ddl_data)
 
     elif name == "remove_schema":
         return linked_schema.remove(args["schemas"])
@@ -396,7 +577,7 @@ def run_autolink_agent(
             except json.JSONDecodeError:
                 fn_args = {}
 
-            result = execute_tool(fn_name, fn_args, executor, vector_store, linked_schema)
+            result = execute_tool(fn_name, fn_args, executor, vector_store, linked_schema, ddl_data)
 
             all_tool_calls.append({
                 "name": fn_name,

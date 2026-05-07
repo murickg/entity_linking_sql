@@ -14,7 +14,7 @@ from src.data_loader import (
     load_local_map,
     resolve_db_name,
 )
-from src.eval_sql_parser import extract_tables_columns, normalize_columns
+from src.eval_sql_parser import extract_tables_columns, normalize_columns, validate_columns_against_schema
 from src.schema_index import get_index
 from src.agent import run_agent
 
@@ -64,6 +64,28 @@ def compute_metrics(predicted: set[str], ground_truth: set[str]) -> dict:
     }
 
 
+def compute_strict_recall(predicted: set[str], ground_truth: set[str]) -> int:
+    """Strict Recall Rate (AutoLink paper): 1 if predicted ⊇ ground_truth, else 0.
+
+    Empty ground_truth counts as success (vacuously true).
+    """
+    if not ground_truth:
+        return 1
+    return 1 if ground_truth.issubset(predicted) else 0
+
+
+def _get_schema_columns(index) -> dict[str, set[str]]:
+    """Extract {table_lower: {col_lower, ...}} from a SchemaIndex for validation."""
+    schema_cols = {}
+    for table_name, table_info in index.tables.items():
+        t_lower = table_name.lower()
+        schema_cols[t_lower] = set()
+        for col_name, col_type in table_info.columns:
+            if "." not in col_name:  # skip nested
+                schema_cols[t_lower].add(col_name.lower())
+    return schema_cols
+
+
 def evaluate_instance_dry(instance: dict, local_map: dict) -> dict | None:
     """Dry run: parse gold SQL and extract ground truth without calling LLM."""
     instance_id = instance["instance_id"]
@@ -81,6 +103,10 @@ def evaluate_instance_dry(instance: dict, local_map: dict) -> dict | None:
 
     index = get_index(db_name, platform=platform)
     known_tables = set(t.lower() for t in index.tables.keys())
+
+    # Validate GT columns against real schema — drop aliases and computed names
+    schema_cols = _get_schema_columns(index)
+    gt_columns = validate_columns_against_schema(gt_columns, gt_tables, schema_cols)
 
     return {
         "instance_id": instance_id,
@@ -121,6 +147,11 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
     # Ground truth
     gt_tables, gt_columns = extract_tables_columns(gold_sql, platform=platform)
     gt_columns = normalize_columns(gt_columns, gt_tables)
+
+    # Validate GT columns against real schema — drop aliases and computed names
+    index_for_schema = get_index(db_name, platform=platform)
+    schema_cols = _get_schema_columns(index_for_schema)
+    gt_columns = validate_columns_against_schema(gt_columns, gt_tables, schema_cols)
 
     # Load external knowledge
     ext_knowledge = None
@@ -165,9 +196,14 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
     pred_tables = set(t.lower() for t in result.get("tables", []))
     pred_columns = set(c.lower() for c in result.get("columns", []))
 
-    # Compute metrics
+    # Compute metrics (P/R/F1)
     table_metrics = compute_metrics(pred_tables, gt_tables)
     column_metrics = compute_metrics(pred_columns, gt_columns)
+
+    # Compute Strict Recall Rate (AutoLink paper metric)
+    srr_table = compute_strict_recall(pred_tables, gt_tables)
+    srr_column = compute_strict_recall(pred_columns, gt_columns)
+    srr_all = 1 if (srr_table and srr_column) else 0
 
     return {
         "instance_id": instance_id,
@@ -180,6 +216,11 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
         "pred_columns": sorted(pred_columns),
         "table_metrics": table_metrics,
         "column_metrics": column_metrics,
+        "srr_table": srr_table,
+        "srr_column": srr_column,
+        "srr_all": srr_all,
+        "n_pred_tables": len(pred_tables),
+        "n_pred_columns": len(pred_columns),
         "iterations": result.get("iterations", 0),
         "tool_calls_count": len(result.get("tool_calls", [])),
         "elapsed_seconds": round(elapsed, 2),
@@ -231,10 +272,12 @@ def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: in
             if not dry_run:
                 tm = result["table_metrics"]
                 cm = result["column_metrics"]
+                srr_t = "✓" if result.get("srr_table") else "✗"
+                srr_c = "✓" if result.get("srr_column") else "✗"
                 logger.log(
                     f"[{i+1}/{len(instances)}] {instance_id} ({inst_platform})  "
-                    f"tables P={tm['precision']:.2f} R={tm['recall']:.2f} F1={tm['f1']:.2f}  "
-                    f"cols P={cm['precision']:.2f} R={cm['recall']:.2f} F1={cm['f1']:.2f}  "
+                    f"tables P={tm['precision']:.2f} R={tm['recall']:.2f} F1={tm['f1']:.2f} SRR={srr_t}  "
+                    f"cols P={cm['precision']:.2f} R={cm['recall']:.2f} F1={cm['f1']:.2f} SRR={srr_c}  "
                     f"time={result['elapsed_seconds']}s"
                 )
             else:
@@ -305,6 +348,11 @@ def aggregate_metrics(results: list[dict], dry_run: bool, logger: RunLogger) -> 
     def avg(values):
         return round(sum(values) / len(values), 4) if values else 0.0
 
+    # SRR metrics (AutoLink paper)
+    srr_table_vals = [r["srr_table"] for r in valid if "srr_table" in r]
+    srr_col_vals = [r["srr_column"] for r in valid if "srr_column" in r]
+    srr_all_vals = [r["srr_all"] for r in valid if "srr_all" in r]
+
     summary = {
         "total_instances": len(valid),
         "table_precision": avg([m["precision"] for m in table_metrics]),
@@ -313,6 +361,14 @@ def aggregate_metrics(results: list[dict], dry_run: bool, logger: RunLogger) -> 
         "column_precision": avg([m["precision"] for m in col_metrics]),
         "column_recall": avg([m["recall"] for m in col_metrics]),
         "column_f1": avg([m["f1"] for m in col_metrics]),
+        # AutoLink-style metrics
+        "srr_table": avg(srr_table_vals),
+        "srr_column": avg(srr_col_vals),
+        "srr_all": avg(srr_all_vals),
+        "avg_pred_tables": avg([r.get("n_pred_tables", 0) for r in valid]),
+        "avg_pred_columns": avg([r.get("n_pred_columns", 0) for r in valid]),
+        "avg_gt_tables": avg([len(r["gt_tables"]) for r in valid]),
+        "avg_gt_columns": avg([len(r["gt_columns"]) for r in valid]),
         "avg_iterations": avg([r["iterations"] for r in valid if "iterations" in r]),
         "avg_elapsed": avg([r["elapsed_seconds"] for r in valid if "elapsed_seconds" in r]),
     }
@@ -322,6 +378,14 @@ def aggregate_metrics(results: list[dict], dry_run: bool, logger: RunLogger) -> 
     logger.log("=" * 70)
     logger.log(f"Tables  - P: {summary['table_precision']:.4f}  R: {summary['table_recall']:.4f}  F1: {summary['table_f1']:.4f}")
     logger.log(f"Columns - P: {summary['column_precision']:.4f}  R: {summary['column_recall']:.4f}  F1: {summary['column_f1']:.4f}")
+    logger.log("")
+    logger.log("AutoLink-style Strict Recall Rate (SRR):")
+    logger.log(f"  SRR-Table:  {summary['srr_table']:.4f}  ({sum(srr_table_vals)}/{len(srr_table_vals)} instances)")
+    logger.log(f"  SRR-Column: {summary['srr_column']:.4f}  ({sum(srr_col_vals)}/{len(srr_col_vals)} instances)")
+    logger.log(f"  SRR-All:    {summary['srr_all']:.4f}  ({sum(srr_all_vals)}/{len(srr_all_vals)} instances)")
+    logger.log("")
+    logger.log(f"Efficiency: avg #pred_tables={summary['avg_pred_tables']:.1f} (gt={summary['avg_gt_tables']:.1f}), "
+               f"avg #pred_columns={summary['avg_pred_columns']:.1f} (gt={summary['avg_gt_columns']:.1f})")
     logger.log(f"Avg iterations: {summary['avg_iterations']:.1f}, Avg time: {summary['avg_elapsed']:.1f}s")
 
     return summary

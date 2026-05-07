@@ -16,12 +16,14 @@ def extract_tables_columns(sql: str, platform: str = "sqlite") -> tuple[set[str]
     """Extract table names and column references from a SQL query.
 
     Returns: (set of table names, set of table.column references)
+    Only includes columns that reference real tables (not CTE aliases or computed names).
     """
     tables = set()
     columns = set()
     cte_names = set()
     table_aliases = {}  # alias -> real table name
     unnest_aliases = set()  # aliases created by UNNEST (BigQuery)
+    select_aliases = set()  # AS aliases from SELECT/CTE (not real columns)
 
     dialect = DIALECT_MAP.get(platform, platform)
 
@@ -45,6 +47,12 @@ def extract_tables_columns(sql: str, platform: str = "sqlite") -> tuple[set[str]
             alias = cte.alias
             if alias:
                 cte_names.add(alias.lower())
+
+        # Collect SELECT aliases (AS names) — these are computed, not real columns
+        for alias_node in statement.find_all(exp.Alias):
+            alias_name = alias_node.alias
+            if alias_name:
+                select_aliases.add(alias_name.lower())
 
         # Collect UNNEST aliases (BigQuery)
         if platform == "bigquery":
@@ -76,7 +84,7 @@ def extract_tables_columns(sql: str, platform: str = "sqlite") -> tuple[set[str]
                 table_aliases[alias.lower()] = name_lower
             table_aliases[name_lower] = name_lower
 
-        # Collect column references
+        # Collect column references — only those tied to real tables
         for col in statement.find_all(exp.Column):
             col_name = col.name
             if not col_name:
@@ -95,10 +103,15 @@ def extract_tables_columns(sql: str, platform: str = "sqlite") -> tuple[set[str]
                 elif table_ref_lower in unnest_aliases:
                     # UNNEST alias — column is a nested field
                     columns.add(f"{table_ref_lower}.{col_name_lower}")
-                else:
+                elif table_ref_lower not in cte_names:
+                    # Unknown table ref, not a CTE — include it
                     columns.add(f"{table_ref_lower}.{col_name_lower}")
+                # If table_ref is a CTE name, skip — it's a CTE-computed column
             else:
-                columns.add(col_name_lower)
+                # Unqualified column — only include if NOT a known SELECT alias
+                # (aliases like "total_spent", "rank", "games_played" are computed, not real)
+                if col_name_lower not in select_aliases:
+                    columns.add(col_name_lower)
 
     return tables, columns
 
@@ -142,3 +155,55 @@ def normalize_columns(columns: set[str], tables: set[str]) -> set[str]:
         else:
             normalized.add(col)
     return normalized
+
+
+def validate_columns_against_schema(
+    columns: set[str],
+    tables: set[str],
+    schema_columns: dict[str, set[str]],
+) -> set[str]:
+    """Filter ground truth columns to only include those that exist in the actual DB schema.
+
+    Args:
+        columns: Ground truth columns (from SQL parsing), may include aliases.
+        tables: Ground truth tables.
+        schema_columns: dict of {table_name_lower: {col_name_lower, ...}} from DDL/PRAGMA.
+
+    Returns: filtered set of columns that exist in the schema.
+    """
+    validated = set()
+
+    # Build a flat set of all known columns for quick lookup
+    all_known_qualified = set()  # "table.column"
+    all_known_bare = {}  # "column" -> set of tables containing it
+    for table, cols in schema_columns.items():
+        for col in cols:
+            all_known_qualified.add(f"{table}.{col}")
+            if col not in all_known_bare:
+                all_known_bare[col] = set()
+            all_known_bare[col].add(table)
+
+    for col in columns:
+        col_lower = col.lower()
+        if "." in col_lower:
+            # table.column format — check if it exists in schema
+            if col_lower in all_known_qualified:
+                validated.add(col_lower)
+        else:
+            # Bare column name — try to resolve to a GT table
+            if col_lower in all_known_bare:
+                # Find which GT tables contain this column
+                matching_tables = all_known_bare[col_lower] & tables
+                if matching_tables:
+                    # Qualify with the table name(s)
+                    for t in matching_tables:
+                        validated.add(f"{t}.{col_lower}")
+                else:
+                    # Column exists in schema but not in GT tables — still valid
+                    # Take any table that has it
+                    for t in all_known_bare[col_lower]:
+                        validated.add(f"{t}.{col_lower}")
+                        break  # just one match is enough
+            # If not found in schema at all, it's an alias — drop it
+
+    return validated
