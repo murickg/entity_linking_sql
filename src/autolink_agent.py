@@ -165,6 +165,16 @@ POWERFUL TOOL — write SQL that uses all the columns you think are needed!
 IMPORTANT: Be selective. Only add tables/columns that are actually needed for the query. \
 Quality over quantity — precision matters as much as recall.
 
+⚠️ CRITICAL RULES (failure to follow = empty result, evaluation = 0):
+- You MUST commit elements to the linked schema before stopping. Use either:
+  - `add_schema(...)` to explicitly add table.column pairs, OR
+  - `verify_schema(...)` which auto-extracts tables and columns from your SQL
+- DO NOT call `stop_action` if the linked schema is empty.
+- BEFORE calling `stop_action`, glance at "Current Linked Schema" below — if it says \
+"(empty schema)", you MUST first call `add_schema` or `verify_schema`.
+- If the database has views (virtual tables), they will be auto-expanded to base tables \
+when added — don't worry about them.
+
 ## Database: {db_name} (SQLite)
 ## All tables in this database: {table_list}
 
@@ -302,6 +312,71 @@ AUTOLINK_TOOLS = [
         },
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# View expansion (Fix 3)
+# ---------------------------------------------------------------------------
+
+def _expand_views(specs: str, executor: SQLiteExecutor, ddl_data: dict) -> tuple[str, list[str]]:
+    """If any spec references a SQL view, replace it with underlying base tables.
+
+    Returns: (expanded_specs, info_messages)
+    """
+    info = []
+    parts = []
+    known_tables_lower = {t.lower(): t for t in ddl_data.keys()}
+
+    for spec in specs.split(";"):
+        spec = spec.strip()
+        if not spec:
+            continue
+
+        if "." in spec:
+            table, col = spec.split(".", 1)
+            table = table.strip()
+        else:
+            table = spec.strip()
+            col = None
+
+        view_sql = executor.get_view_definition(table)
+        if view_sql is None:
+            parts.append(spec)
+            continue
+
+        # Parse the view definition to find base tables
+        try:
+            parsed = sqlglot.parse(view_sql, read="sqlite")
+        except sqlglot.errors.ParseError:
+            parts.append(spec)
+            continue
+
+        base_tables = set()
+        for stmt in parsed:
+            if stmt is None:
+                continue
+            for t in stmt.find_all(exp.Table):
+                name = t.name
+                if not name:
+                    continue
+                name_lower = name.lower()
+                # Skip the view itself
+                if name_lower == table.lower():
+                    continue
+                # Skip if this is also a view (nested views — recurse one level)
+                if executor.get_view_definition(name) is not None:
+                    continue
+                if name_lower in known_tables_lower:
+                    base_tables.add(known_tables_lower[name_lower])
+
+        if base_tables:
+            for bt in base_tables:
+                parts.append(bt)
+            info.append(f"Expanded view '{table}' → {sorted(base_tables)}")
+        else:
+            parts.append(spec)
+
+    return "; ".join(parts), info
 
 
 # ---------------------------------------------------------------------------
@@ -464,30 +539,42 @@ def execute_tool(
         known_tables = set(ddl_data.keys()) if ddl_data else set()
         extracted = _extract_schema_from_sql(sql, known_tables)
         auto_added = []
+        expansion_info = []
         if extracted:
             specs = "; ".join(extracted)
-            add_msg = linked_schema.add(specs)
-            for spec in extracted:
+            # Fix 3: expand views into base tables
+            if ddl_data is not None:
+                specs, expansion_info = _expand_views(specs, executor, ddl_data)
+            linked_schema.add(specs)
+            for spec in specs.split(";"):
+                spec = spec.strip()
                 if "." in spec:
                     t, c = spec.split(".", 1)
-                    vector_store.mark_excluded(t, c)
-            auto_added_items = [s for s in extracted if "." in s]
-            if auto_added_items:
-                auto_added = auto_added_items
+                    vector_store.mark_excluded(t.strip(), c.strip())
+            auto_added = [s.strip() for s in specs.split(";") if "." in s]
 
         result = exec_result
         if auto_added:
             result += f"\n\n[Auto-linked from SQL: {', '.join(auto_added[:15])}]"
+        if expansion_info:
+            result += "\n" + "\n".join(expansion_info)
         return result
 
     elif name == "add_schema":
-        result = linked_schema.add(args["schemas"])
+        # Fix 3: expand views into their base tables
+        specs = args["schemas"]
+        expansion_info = []
+        if ddl_data is not None:
+            specs, expansion_info = _expand_views(specs, executor, ddl_data)
+        result = linked_schema.add(specs)
         # Mark added columns as excluded from future retrieval
-        for spec in args["schemas"].split(";"):
+        for spec in specs.split(";"):
             spec = spec.strip()
             if "." in spec:
                 table, col = spec.split(".", 1)
                 vector_store.mark_excluded(table.strip(), col.strip())
+        if expansion_info:
+            result += "\n" + "\n".join(expansion_info)
         return result
 
     elif name == "match_literal":
@@ -499,6 +586,12 @@ def execute_tool(
         return linked_schema.remove(args["schemas"])
 
     elif name == "stop_action":
+        # Block stopping if LinkedSchema is empty — force the agent to commit first
+        if not linked_schema.tables:
+            return ("[ERROR: Cannot stop with empty linked schema. "
+                    "You must call `add_schema` or `verify_schema` first to commit "
+                    "at least one table/column. Review the candidate columns above "
+                    "and the current empty schema, then add the relevant elements.]")
         return "__STOP__"
 
     return f"Unknown action: {name}"
@@ -610,6 +703,20 @@ def run_autolink_agent(
             linked_schema=linked_schema.to_mschema(ddl_data),
         )
         messages[0] = {"role": "system", "content": system_msg}
+
+    # Fix 1: Safety net — if LinkedSchema is empty, fall back to initial top-N candidates
+    if not linked_schema.tables and initial_docs:
+        print(f"  [WARN] Empty LinkedSchema after agent loop — falling back to initial top-{len(initial_docs)} candidates")
+        for doc in initial_docs:
+            linked_schema.tables.add(doc.table_name)
+            if doc.table_name not in linked_schema.columns:
+                linked_schema.columns[doc.table_name] = set()
+            linked_schema.columns[doc.table_name].add(doc.column_name)
+        all_tool_calls.append({
+            "name": "__fallback__",
+            "args": {"reason": "empty linked schema"},
+            "result_preview": f"Used initial top-{len(initial_docs)} candidates as fallback",
+        })
 
     output = linked_schema.to_result()
     output["iterations"] = iteration + 1 if 'iteration' in dir() else 0

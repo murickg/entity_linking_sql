@@ -223,6 +223,7 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
         "n_pred_columns": len(pred_columns),
         "iterations": result.get("iterations", 0),
         "tool_calls_count": len(result.get("tool_calls", [])),
+        "tool_calls": result.get("tool_calls", []),
         "elapsed_seconds": round(elapsed, 2),
         "error": result.get("error"),
     }

@@ -81,6 +81,25 @@ class SQLiteExecutor:
         except Exception:
             return []
 
+    def get_view_definition(self, name: str) -> str | None:
+        """Return CREATE VIEW SQL if `name` is a view, else None."""
+        try:
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=self.timeout
+            )
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT type, sql FROM sqlite_master WHERE lower(name) = lower(?)",
+                (name,),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0] == "view":
+                return row[1]
+            return None
+        except Exception:
+            return None
+
     def get_table_info(self, table: str) -> list[dict]:
         """Return PRAGMA table_info as list of dicts."""
         sql = f'PRAGMA table_info("{table}")'
