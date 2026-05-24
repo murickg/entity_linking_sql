@@ -20,7 +20,8 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 # OpenRouter API
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-MODEL = "anthropic/claude-sonnet-4"
+MODEL = "anthropic/claude-sonnet-4"        # agent loop + descriptions
+SQL_GEN_MODEL = "deepseek/deepseek-r1"     # SQL generation + revision + selection (reasoning model)
 
 # Agent settings (baseline BM25)
 MAX_AGENT_ITERATIONS = 10
@@ -29,11 +30,15 @@ SEARCH_TOP_K_COLUMNS = 20
 
 # AutoLink settings
 SQLITE_DB_DIR = PROJECT_ROOT / "local_sqlite"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 EMBEDDING_CACHE_DIR = PROJECT_ROOT / "cache" / "embeddings"
 DESCRIPTION_CACHE_DIR = PROJECT_ROOT / "cache" / "descriptions"
-VS_INITIAL_TOP_N = 20
+VS_INITIAL_TOP_N = 50
 VS_RETRIEVE_TOP_M = 3
 SQLITE_TIMEOUT = 5.0
 SQLITE_MAX_ROWS = 50
-AUTOLINK_MAX_TURNS = 20
+AUTOLINK_MAX_TURNS = 30
+
+# Heuristics (recall boosters) — can be disabled for "pure agent" evaluation
+ENABLE_IDENTIFIER_INJECTION = True   # auto-add *_id, *_code, *_number cols
+ENABLE_FAMILY_EXPANSION = True       # auto-expand col_1..N families

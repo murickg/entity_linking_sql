@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets — never commit
+snowflake_credential/
+bigquery_credentials/
+.env
+*.pem
+
+# Local caches & outputs
+cache/
+runs/
+results/
+local_sqlite/*.sqlite
+
+# AutoLink working dir
+log_*/

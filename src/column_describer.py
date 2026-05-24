@@ -88,7 +88,7 @@ def generate_descriptions_for_table(
                 {"role": "user", "content": profile_text},
             ],
             temperature=0.0,
-            max_tokens=2000,
+            max_tokens=4000,
         )
         content = response.choices[0].message.content.strip()
 
@@ -148,9 +148,22 @@ def generate_all_descriptions(
     all_descriptions: dict[str, str] = {}
     total_tables = len(tables)
 
+    BATCH_SIZE = 30  # Avoid LLM response truncation for wide tables (e.g. BQ ga_sessions)
+
     for i, (table_name, cols) in enumerate(tables.items()):
-        print(f"  Generating descriptions for {table_name} ({i+1}/{total_tables})...")
-        descs = generate_descriptions_for_table(table_name, cols)
+        if len(cols) <= BATCH_SIZE:
+            print(f"  Generating descriptions for {table_name} ({i+1}/{total_tables}, {len(cols)} cols)...")
+            descs = generate_descriptions_for_table(table_name, cols)
+        else:
+            # Batch wide tables to avoid response truncation
+            print(f"  Generating descriptions for {table_name} ({i+1}/{total_tables}, {len(cols)} cols, batched)...")
+            descs = {}
+            n_batches = (len(cols) + BATCH_SIZE - 1) // BATCH_SIZE
+            for b in range(n_batches):
+                batch_cols = cols[b * BATCH_SIZE : (b + 1) * BATCH_SIZE]
+                print(f"    Batch {b+1}/{n_batches} ({len(batch_cols)} cols)...")
+                batch_descs = generate_descriptions_for_table(table_name, batch_cols)
+                descs.update(batch_descs)
         for col_name, desc in descs.items():
             all_descriptions[f"{table_name}.{col_name}"] = desc
 

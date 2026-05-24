@@ -12,6 +12,8 @@ from src.config import (
     MODEL,
     AUTOLINK_MAX_TURNS,
     VS_RETRIEVE_TOP_M,
+    ENABLE_IDENTIFIER_INJECTION,
+    ENABLE_FAMILY_EXPANSION,
 )
 from src.sqlite_executor import SQLiteExecutor
 from src.vector_store import VectorStore
@@ -90,8 +92,6 @@ class LinkedSchema:
 
             linked_cols = []
             for col_name, col_type in all_columns:
-                if "." in col_name:
-                    continue
                 if col_name in cols:
                     linked_cols.append(f"  ({col_name}, {col_type})")
 
@@ -174,6 +174,32 @@ Quality over quantity — precision matters as much as recall.
 "(empty schema)", you MUST first call `add_schema` or `verify_schema`.
 - If the database has views (virtual tables), they will be auto-expanded to base tables \
 when added — don't worry about them.
+
+📋 PATTERNS TO WATCH FOR (these are common sources of missed schema):
+
+1. **LINKAGE / JOIN tables** — If the question requires combining 2 entities (e.g. \
+"players in matches"), look for a separate junction table like `player_match`, \
+`order_items`, `*_xref`. The query will FAIL without it.
+
+2. **IDENTIFIER columns** — For each table you commit, also include its identifier \
+column(s). Look for names like `*_id`, `*_number`, `*_code`, `*_uuid`. Even if the \
+question doesn't mention them explicitly, they are needed for joins and output.
+
+3. **ALL columns of a name-family** — If a table has indexed columns like \
+`home_player_1`, `home_player_2`, … `home_player_11`, the question likely needs ALL of them. \
+Don't just commit one — check `PRAGMA table_info` or `INFORMATION_SCHEMA.COLUMNS` \
+and add the full family.
+
+4. **TIME / DATE columns** — Questions with "when", "duration", "lifespan", \
+"recent", "before/after" need explicit date columns. Search for them via \
+`retrieve_schema("date column for X")` if not obvious.
+
+5. **AGGREGATE-input columns** — If the question says "average sales", "total spend", \
+"max games", you need both the numeric column (`price`, `amount`, `g`) AND \
+the grouping/key column (e.g. `customer_id`).
+
+6. **Multi-table queries** — If `gt_tables` are more than 3, you likely need \
+linkage tables. Be EXHAUSTIVE in `retrieve_schema` calls before stopping.
 
 ## Database: {db_name} (SQLite)
 ## All tables in this database: {table_list}
@@ -383,14 +409,20 @@ def _expand_views(specs: str, executor: SQLiteExecutor, ddl_data: dict) -> tuple
 # SQL → schema extraction (task alignment from AT&T paper)
 # ---------------------------------------------------------------------------
 
-def _extract_schema_from_sql(sql: str, known_tables: set[str]) -> list[str]:
+def _extract_schema_from_sql(sql: str, known_tables: set[str], dialect: str = "sqlite") -> list[str]:
     """Parse a draft SQL and extract table.column pairs that exist in the DB.
 
     Returns list of 'table.column' strings for auto-addition to LinkedSchema.
+    Catches all sqlglot errors (ParseError, TokenError) — returns [] gracefully.
     """
-    try:
-        parsed = sqlglot.parse(sql, read="sqlite")
-    except sqlglot.errors.ParseError:
+    # Try platform-native dialect first, fall back to sqlite, then None
+    for read_dialect in (dialect, "sqlite", None):
+        try:
+            parsed = sqlglot.parse(sql, read=read_dialect)
+            break
+        except Exception:
+            continue
+    else:
         return []
 
     table_aliases: dict[str, str] = {}  # alias -> real table
@@ -439,6 +471,148 @@ def _extract_schema_from_sql(sql: str, known_tables: set[str]) -> list[str]:
             # No table ref — skip (ambiguous)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Auto-Identifier Injection
+# ---------------------------------------------------------------------------
+
+# Regex for identifier-looking columns: ends in _id, _number, _code, _uuid,
+# or is exactly "id" / "code", or like "team_1" / "*_1..9" (family columns).
+_IDENTIFIER_PATTERN = re.compile(
+    r"(?:^id$|^code$|_id$|_number$|_code$|_uuid$|_key$|_pk$|_fk$)",
+    re.IGNORECASE,
+)
+
+
+def _is_identifier_col(col_name: str) -> bool:
+    return bool(_IDENTIFIER_PATTERN.search(col_name))
+
+
+def _inject_identifiers(
+    linked_schema: "LinkedSchema",
+    ddl_data: dict,
+    vector_store,
+) -> list[str]:
+    """For every table in linked_schema, auto-add its identifier columns.
+
+    Adds directly to `columns` (full schema, visible to SQL gen).
+    Returns list of added 'table.col' strings.
+    """
+    added = []
+    for table in list(linked_schema.tables):
+        canonical = table
+        for t in ddl_data.keys():
+            if t.lower() == table.lower():
+                canonical = t
+                break
+        table_info = ddl_data.get(canonical, {})
+        for col_name, _ in table_info.get("columns", []):
+            if "." in col_name:
+                continue
+            if not _is_identifier_col(col_name):
+                continue
+            cur_cols = linked_schema.columns.get(table, set())
+            if col_name in cur_cols:
+                continue
+            linked_schema.tables.add(table)
+            linked_schema.columns.setdefault(table, set()).add(col_name)
+            vector_store.mark_excluded(table, col_name)
+            added.append(f"{table}.{col_name}")
+    return added
+
+
+# ---------------------------------------------------------------------------
+# Column Family Expansion
+# ---------------------------------------------------------------------------
+
+# Detects a numeric-suffix family: "home_player_1" -> ("home_player_", "1")
+# Also catches "col1" / "team_a" — we only expand numeric.
+_FAMILY_PATTERN = re.compile(r"^(.+?)([_]?)(\d+)$")
+
+
+def _family_prefix(col_name: str) -> str | None:
+    """Return the prefix (without numeric suffix) if column looks like family member.
+
+    'home_player_1' -> 'home_player_'
+    'team_1'        -> 'team_'
+    'col1'          -> 'col'
+    'colA'          -> None  (not numeric)
+    """
+    m = _FAMILY_PATTERN.match(col_name)
+    if not m:
+        return None
+    return m.group(1) + m.group(2)
+
+
+def _expand_column_families(
+    linked_schema: "LinkedSchema",
+    ddl_data: dict,
+    vector_store,
+    proactive: bool = True,
+    family_min_size: int = 3,
+) -> list[str]:
+    """For columns with numeric suffix, expand to the full family.
+
+    Two modes:
+    - Reactive: if `match.home_player_1` was committed → add `home_player_2..11`.
+    - Proactive (default): for every table in linked_schema, discover ALL families
+      (≥`family_min_size` members) in its DDL and add the whole group.
+
+    Returns list of added 'table.col' strings.
+    """
+    added = []
+    for table in list(linked_schema.tables):
+        # Find canonical case from DDL
+        canonical = table
+        for t in ddl_data.keys():
+            if t.lower() == table.lower():
+                canonical = t
+                break
+        table_info = ddl_data.get(canonical, {})
+        all_table_cols = {c for c, _ in table_info.get("columns", []) if "." not in c}
+
+        committed = linked_schema.columns.get(table, set())
+
+        # ---- Reactive: prefixes from currently-committed columns ----
+        reactive_prefixes: set[str] = set()
+        for col in committed:
+            p = _family_prefix(col)
+            if p is not None:
+                reactive_prefixes.add(p)
+
+        # ---- Proactive: discover families from DDL columns alone ----
+        proactive_prefixes: set[str] = set()
+        if proactive:
+            prefix_counts: dict[str, int] = {}
+            for c in all_table_cols:
+                p = _family_prefix(c)
+                if p is not None:
+                    prefix_counts[p] = prefix_counts.get(p, 0) + 1
+            for p, count in prefix_counts.items():
+                if count >= family_min_size:
+                    proactive_prefixes.add(p)
+
+        all_prefixes = reactive_prefixes | proactive_prefixes
+
+        # For each prefix, find ALL members in the table
+        for prefix in all_prefixes:
+            family = []
+            for c in all_table_cols:
+                m = _FAMILY_PATTERN.match(c)
+                if m and m.group(1) + m.group(2) == prefix:
+                    family.append(c)
+            # Reactive families: need 2+ members; proactive: family_min_size
+            min_size = 2 if prefix in reactive_prefixes else family_min_size
+            if len(family) < min_size:
+                continue
+            for c in family:
+                if c in committed:
+                    continue
+                linked_schema.columns.setdefault(table, set()).add(c)
+                vector_store.mark_excluded(table, c)
+                added.append(f"{table}.{c}")
+    return added
 
 
 # ---------------------------------------------------------------------------
@@ -513,17 +687,23 @@ def _find_literal_in_db(literal: str, executor: SQLiteExecutor, ddl_data: dict) 
 def execute_tool(
     name: str,
     args: dict,
-    executor: SQLiteExecutor,
+    executor,  # SQLiteExecutor or SnowflakeExecutor — duck-typed
     vector_store: VectorStore,
     linked_schema: LinkedSchema,
     ddl_data: dict | None = None,
 ) -> str:
     """Execute an AutoLink tool call and return observation."""
     if name == "explore_schema":
-        return executor.execute(args["sql_query"])
+        sql = args.get("sql_query", "")
+        if not sql:
+            return "[ERROR: explore_schema requires `sql_query` argument]"
+        return executor.execute(sql)
 
     elif name == "retrieve_schema":
-        results = vector_store.retrieve(args["nl_query"], top_m=VS_RETRIEVE_TOP_M)
+        nl_query = args.get("nl_query", "")
+        if not nl_query:
+            return "[ERROR: retrieve_schema requires `nl_query` argument]"
+        results = vector_store.retrieve(nl_query, top_m=VS_RETRIEVE_TOP_M)
         if not results:
             return "No matching columns found."
         lines = []
@@ -532,12 +712,22 @@ def execute_tool(
         return "Retrieved columns:\n" + "\n".join(lines)
 
     elif name == "verify_schema":
-        sql = args["sql_query"]
+        sql = args.get("sql_query", "")
+        if not sql:
+            return "[ERROR: verify_schema requires `sql_query` argument]"
         exec_result = executor.execute(sql)
 
         # Auto-extract schema from the draft SQL (task alignment)
         known_tables = set(ddl_data.keys()) if ddl_data else set()
-        extracted = _extract_schema_from_sql(sql, known_tables)
+        # Pick SQL dialect from executor class name
+        ex_cls = type(executor).__name__.lower()
+        if "snowflake" in ex_cls:
+            sql_dialect = "snowflake"
+        elif "bigquery" in ex_cls:
+            sql_dialect = "bigquery"
+        else:
+            sql_dialect = "sqlite"
+        extracted = _extract_schema_from_sql(sql, known_tables, dialect=sql_dialect)
         auto_added = []
         expansion_info = []
         if extracted:
@@ -553,16 +743,30 @@ def execute_tool(
                     vector_store.mark_excluded(t.strip(), c.strip())
             auto_added = [s.strip() for s in specs.split(";") if "." in s]
 
+        # Auto-inject identifier columns + expand column families (optional)
+        injected = []
+        family_added = []
+        if ddl_data is not None and auto_added:
+            if ENABLE_IDENTIFIER_INJECTION:
+                injected = _inject_identifiers(linked_schema, ddl_data, vector_store)
+            if ENABLE_FAMILY_EXPANSION:
+                family_added = _expand_column_families(linked_schema, ddl_data, vector_store)
+
         result = exec_result
         if auto_added:
             result += f"\n\n[Auto-linked from SQL: {', '.join(auto_added[:15])}]"
         if expansion_info:
             result += "\n" + "\n".join(expansion_info)
+        if injected:
+            result += f"\n[Auto-injected identifier cols: {', '.join(injected[:15])}]"
+        if family_added:
+            result += f"\n[Auto-expanded column family: {', '.join(family_added[:15])}]"
         return result
 
     elif name == "add_schema":
-        # Fix 3: expand views into their base tables
-        specs = args["schemas"]
+        specs = args.get("schemas", "")
+        if not specs:
+            return "[ERROR: add_schema requires `schemas` argument (e.g. 'table.col1; table.col2')]"
         expansion_info = []
         if ddl_data is not None:
             specs, expansion_info = _expand_views(specs, executor, ddl_data)
@@ -573,17 +777,35 @@ def execute_tool(
             if "." in spec:
                 table, col = spec.split(".", 1)
                 vector_store.mark_excluded(table.strip(), col.strip())
+        # Auto-inject identifier columns for newly added tables (optional)
+        injected = []
+        family_added = []
+        if ddl_data is not None:
+            if ENABLE_IDENTIFIER_INJECTION:
+                injected = _inject_identifiers(linked_schema, ddl_data, vector_store)
+            if ENABLE_FAMILY_EXPANSION:
+                family_added = _expand_column_families(linked_schema, ddl_data, vector_store)
         if expansion_info:
             result += "\n" + "\n".join(expansion_info)
+        if injected:
+            result += f"\n[Auto-injected identifier cols: {', '.join(injected[:15])}]"
+        if family_added:
+            result += f"\n[Auto-expanded column family: {', '.join(family_added[:15])}]"
         return result
 
     elif name == "match_literal":
         if ddl_data is None:
             return "[ERROR: No DDL data available]"
-        return _find_literal_in_db(args["literal"], executor, ddl_data)
+        literal = args.get("literal", "")
+        if not literal:
+            return "[ERROR: match_literal requires `literal` argument (a value to search for, e.g. 'Fresno')]"
+        return _find_literal_in_db(literal, executor, ddl_data)
 
     elif name == "remove_schema":
-        return linked_schema.remove(args["schemas"])
+        specs = args.get("schemas", "")
+        if not specs:
+            return "[ERROR: remove_schema requires `schemas` argument]"
+        return linked_schema.remove(specs)
 
     elif name == "stop_action":
         # Block stopping if LinkedSchema is empty — force the agent to commit first
@@ -605,7 +827,7 @@ def run_autolink_agent(
     question: str,
     db_name: str,
     ddl_data: dict,
-    executor: SQLiteExecutor,
+    executor,  # SQLiteExecutor or SnowflakeExecutor — duck-typed
     vector_store: VectorStore,
     external_knowledge: str | None = None,
     max_turns: int = AUTOLINK_MAX_TURNS,
@@ -645,6 +867,8 @@ def run_autolink_agent(
     ]
 
     all_tool_calls = []
+    prompt_tokens_total = 0
+    completion_tokens_total = 0
 
     for iteration in range(max_turns):
         response = client.chat.completions.create(
@@ -652,7 +876,13 @@ def run_autolink_agent(
             messages=messages,
             tools=AUTOLINK_TOOLS,
             tool_choice="auto",
+            temperature=0.0,
         )
+
+        # Track token usage
+        if response.usage:
+            prompt_tokens_total += response.usage.prompt_tokens or 0
+            completion_tokens_total += response.usage.completion_tokens or 0
 
         msg = response.choices[0].message
 
@@ -670,7 +900,10 @@ def run_autolink_agent(
             except json.JSONDecodeError:
                 fn_args = {}
 
-            result = execute_tool(fn_name, fn_args, executor, vector_store, linked_schema, ddl_data)
+            try:
+                result = execute_tool(fn_name, fn_args, executor, vector_store, linked_schema, ddl_data)
+            except Exception as e:
+                result = f"[ERROR: tool `{fn_name}` raised {type(e).__name__}: {str(e)[:200]}]"
 
             all_tool_calls.append({
                 "name": fn_name,
@@ -679,12 +912,36 @@ def run_autolink_agent(
             })
 
             if result == "__STOP__":
-                stop = True
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": "Schema linking process completed.",
-                })
+                # Force-review: if agent stops early AND linked schema is sparse,
+                # nudge it to do at least one more retrieval pass.
+                early = iteration < max_turns // 3
+                sparse = (len(linked_schema.tables) < 2
+                          or sum(len(c) for c in linked_schema.columns.values()) < 4)
+                already_nudged = any(c.get("name") == "__nudge__" for c in all_tool_calls)
+                if early and sparse and not already_nudged:
+                    nudge_text = (
+                        f"[NUDGE] You called stop_action after only {iteration + 1} turns "
+                        f"with a sparse linked schema (tables={len(linked_schema.tables)}, "
+                        f"columns={sum(len(c) for c in linked_schema.columns.values())}). "
+                        "Before stopping, please do at least one more `retrieve_schema` "
+                        "for any missing aspect of the question (identifier columns, "
+                        "join/linkage tables, date columns, aggregate inputs)."
+                    )
+                    all_tool_calls.append({"name": "__nudge__", "args": {},
+                                           "result_preview": "force-review issued"})
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": nudge_text,
+                    })
+                    # Don't stop — let the agent process the nudge
+                else:
+                    stop = True
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": "Schema linking process completed.",
+                    })
             else:
                 messages.append({
                     "role": "tool",
@@ -721,4 +978,9 @@ def run_autolink_agent(
     output = linked_schema.to_result()
     output["iterations"] = iteration + 1 if 'iteration' in dir() else 0
     output["tool_calls"] = all_tool_calls
+    output["tokens"] = {
+        "prompt": prompt_tokens_total,
+        "completion": completion_tokens_total,
+        "total": prompt_tokens_total + completion_tokens_total,
+    }
     return output

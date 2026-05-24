@@ -124,6 +124,8 @@ def main():
                         default=None, help="Filter to a specific platform (default: all)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Max number of instances to evaluate")
+    parser.add_argument("--instances", nargs="+", default=None,
+                        help="Run only specific instances by ID, e.g. --instances bq042 local019")
     parser.add_argument("--autolink", action="store_true",
                         help="Use AutoLink agent (SQLite only)")
 
@@ -137,6 +139,7 @@ def main():
             dry_run=args.dry_run,
             limit=args.limit,
             use_autolink=args.autolink,
+            instance_ids=args.instances,
         )
     else:
         parser.print_help()

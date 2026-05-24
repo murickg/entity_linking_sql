@@ -75,14 +75,27 @@ def compute_strict_recall(predicted: set[str], ground_truth: set[str]) -> int:
 
 
 def _get_schema_columns(index) -> dict[str, set[str]]:
-    """Extract {table_lower: {col_lower, ...}} from a SchemaIndex for validation."""
+    """Extract {table_lower: {col_lower, ...}} from a SchemaIndex for validation.
+
+    For Snowflake / BigQuery: also expose short name (after last dot) so GT
+    columns referenced without full path can be resolved.
+    """
     schema_cols = {}
     for table_name, table_info in index.tables.items():
         t_lower = table_name.lower()
-        schema_cols[t_lower] = set()
+        cols = set()
         for col_name, col_type in table_info.columns:
             if "." not in col_name:  # skip nested
-                schema_cols[t_lower].add(col_name.lower())
+                cols.add(col_name.lower())
+        # Full key
+        if t_lower not in schema_cols:
+            schema_cols[t_lower] = set()
+        schema_cols[t_lower] |= cols
+        # Short-name alias for DB.SCHEMA.TABLE -> TABLE
+        if "." in t_lower:
+            short = t_lower.rsplit(".", 1)[-1]
+            schema_cols.setdefault(short, set())
+            schema_cols[short] |= cols
     return schema_cols
 
 
@@ -170,14 +183,68 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
         if not sqlite_path:
             return None
 
-        ddl_data = load_ddl(db_name, platform="sqlite")
+        ddl_data_full = load_ddl(db_name, platform="sqlite")
         executor = SQLiteExecutor(sqlite_path)
-        vector_store = get_vector_store(db_name, ddl_data, sqlite_path)
+        vector_store = get_vector_store(db_name, ddl_data_full, sqlite_path)
 
         result = run_autolink_agent(
             question=instance["question"],
             db_name=db_name,
-            ddl_data=ddl_data,
+            ddl_data=ddl_data_full,
+            executor=executor,
+            vector_store=vector_store,
+            external_knowledge=ext_knowledge,
+        )
+    elif use_autolink and platform == "snowflake":
+        from src.autolink_agent import run_autolink_agent
+        from src.snowflake_executor import SnowflakeExecutor
+        from src.vector_store import get_vector_store
+        from src.data_loader import load_sample_rows_from_json
+
+        ddl_data_full = load_ddl(db_name, platform="snowflake")
+        # Infer schema from full-path keys
+        schema_counts: dict[str, int] = {}
+        for tname in ddl_data_full:
+            parts = tname.split(".")
+            if len(parts) == 3:
+                schema_counts[parts[1]] = schema_counts.get(parts[1], 0) + 1
+        default_schema = max(schema_counts, key=schema_counts.get) if schema_counts else None
+
+        executor = SnowflakeExecutor(default_db=db_name, default_schema=default_schema)
+        external_samples = load_sample_rows_from_json(db_name, "snowflake")
+        vector_store = get_vector_store(
+            db_name, ddl_data_full,
+            sqlite_path=None,
+            external_samples=external_samples,
+        )
+
+        result = run_autolink_agent(
+            question=instance["question"],
+            db_name=db_name,
+            ddl_data=ddl_data_full,
+            executor=executor,
+            vector_store=vector_store,
+            external_knowledge=ext_knowledge,
+        )
+    elif use_autolink and platform == "bigquery":
+        from src.autolink_agent import run_autolink_agent
+        from src.bigquery_executor import BigQueryExecutor
+        from src.vector_store import get_vector_store
+        from src.data_loader import load_sample_rows_from_json
+
+        ddl_data_full = load_ddl(db_name, platform="bigquery")
+        external_samples = load_sample_rows_from_json(db_name, "bigquery")
+        executor = BigQueryExecutor(sample_rows=external_samples)
+        vector_store = get_vector_store(
+            db_name, ddl_data_full,
+            sqlite_path=None,
+            external_samples=external_samples,
+        )
+
+        result = run_autolink_agent(
+            question=instance["question"],
+            db_name=db_name,
+            ddl_data=ddl_data_full,
             executor=executor,
             vector_store=vector_store,
             external_knowledge=ext_knowledge,
@@ -192,9 +259,28 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
 
     elapsed = time.time() - start_time
 
-    # Normalize predictions
-    pred_tables = set(t.lower() for t in result.get("tables", []))
-    pred_columns = set(c.lower() for c in result.get("columns", []))
+    def _short_table(t: str) -> str:
+        return t.rsplit(".", 1)[-1].lower().strip('"')
+
+    def _short_col(c: str) -> str:
+        # "X.Y.Z.col" -> "z.col"
+        c = c.lower().strip('"')
+        if "." in c:
+            parts = c.rsplit(".", 2) if c.count(".") >= 2 else c.rsplit(".", 1)
+            if len(parts) == 3:
+                return f"{parts[1]}.{parts[2]}"
+            return c
+        return c
+
+    # Normalize predictions — for snowflake/bigquery collapse to short names
+    if platform in ("snowflake", "bigquery"):
+        pred_tables = {_short_table(t) for t in result.get("tables", [])}
+        pred_columns = {_short_col(c) for c in result.get("columns", [])}
+        gt_tables = {_short_table(t) for t in gt_tables}
+        gt_columns = {_short_col(c) for c in gt_columns}
+    else:
+        pred_tables = set(t.lower() for t in result.get("tables", []))
+        pred_columns = set(c.lower() for c in result.get("columns", []))
 
     # Compute metrics (P/R/F1)
     table_metrics = compute_metrics(pred_tables, gt_tables)
@@ -229,26 +315,59 @@ def evaluate_instance(instance: dict, local_map: dict, use_autolink: bool = Fals
     }
 
 
-def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: int | None = None, use_autolink: bool = False) -> dict:
+def run_evaluation(
+    platform: str | None = None,
+    dry_run: bool = False,
+    limit: int | None = None,
+    use_autolink: bool = False,
+    instance_ids: list[str] | None = None,
+) -> dict:
     """Run evaluation on instances with gold SQL.
 
     Args:
         platform: Filter to 'sqlite', 'bigquery', 'snowflake', or None for all.
         dry_run: If True, only parse gold SQL without LLM calls.
         limit: Max number of instances to evaluate.
-        use_autolink: If True, use AutoLink agent for SQLite instances.
+        use_autolink: If True, use AutoLink agent.
+        instance_ids: If provided, runs only these specific instances.
     """
     command = " ".join(sys.argv)
     logger = RunLogger(command=command, platform=platform, dry_run=dry_run)
 
     instances = get_instances_with_gold_sql(platform=platform)
-    if limit is not None:
+    if instance_ids:
+        wanted = set(instance_ids)
+        instances = [i for i in instances if i["instance_id"] in wanted]
+        missing = wanted - {i["instance_id"] for i in instances}
+        if missing:
+            logger.log(f"⚠️  Requested instances not found: {sorted(missing)}")
+    elif limit is not None:
         instances = instances[:limit]
     local_map = load_local_map()
 
     platform_label = platform or "all"
     logger.log(f"Found {len(instances)} instances with gold SQL (platform={platform_label})")
     logger.log("")
+
+    # Set up incremental JSON output
+    RESULTS_DIR.mkdir(exist_ok=True)
+    suffix = "_dry" if dry_run else ""
+    output_path = RESULTS_DIR / f"evaluation_results_{platform_label}{suffix}.json"
+
+    def flush_json(results, summary=None, partial=True):
+        payload = {
+            "platform": platform_label,
+            "command": " ".join(sys.argv),
+            "completed_instances": len(results),
+            "total_instances": len(instances),
+            "in_progress": partial,
+            "instances": results,
+            "summary": summary,
+        }
+        tmp = output_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        tmp.replace(output_path)
 
     results = []
     for i, inst in enumerate(instances):
@@ -266,6 +385,11 @@ def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: in
                 "instance_id": instance_id,
                 "error": str(e),
             })
+            # Flush even on per-instance crash
+            try:
+                flush_json(results, partial=(i < len(instances) - 1))
+            except Exception:
+                pass
             continue
 
         if result:
@@ -290,17 +414,18 @@ def run_evaluation(platform: str | None = None, dry_run: bool = False, limit: in
         else:
             logger.log(f"[{i+1}/{len(instances)}] {instance_id} ({inst_platform})  SKIPPED")
 
+        # Flush JSON after each instance — preserves state on crash
+        try:
+            flush_json(results, partial=(i < len(instances) - 1))
+        except Exception as e:
+            logger.log(f"  [WARN] Failed to flush JSON: {e}")
+
     # Aggregate metrics
     logger.log("")
     summary = aggregate_metrics(results, dry_run, logger)
 
-    # Save JSON results
-    RESULTS_DIR.mkdir(exist_ok=True)
-    output = {"platform": platform_label, "instances": results, "summary": summary}
-    suffix = "_dry" if dry_run else ""
-    output_path = RESULTS_DIR / f"evaluation_results_{platform_label}{suffix}.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    # Final flush with summary
+    flush_json(results, summary=summary, partial=False)
     logger.log(f"\nJSON results saved to {output_path}")
     logger.log(f"Run log saved to {logger.path}")
 

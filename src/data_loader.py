@@ -282,21 +282,99 @@ def load_ddl(db_name: str, platform: str = "sqlite") -> dict[str, dict]:
         for schema_dir in db_dir.iterdir():
             if not schema_dir.is_dir():
                 continue
+            schema_name = schema_dir.name
             ddl_path = schema_dir / "DDL.csv"
             if ddl_path.exists():
                 tables = _read_ddl_csv(ddl_path, platform)
-                # Store tables under both full name (db.schema.table) and short name (table)
+                # Build full-path key: DB.SCHEMA.TABLE (use folder schema if not already in name)
                 normalized = {}
                 for name, data in tables.items():
-                    normalized[name] = data
-                    # Add short name (last part after dots)
-                    short = name.rsplit(".", 1)[-1] if "." in name else name
-                    if short != name:
+                    if "." in name:
+                        full = name
+                    else:
+                        full = f"{db_name}.{schema_name}.{name}"
+                    normalized[full] = data
+                    # Also keep short name for backward-compat lookups
+                    short = full.rsplit(".", 1)[-1]
+                    if short != full:
                         normalized[short] = data
                 result.update(normalized)
         return result
 
     return {}
+
+
+def get_bq_table_fullnames(db_name: str) -> dict[str, str]:
+    """For each short table name in BQ DDL, return a fully-qualified wildcard fullname.
+
+    Example: "ga_sessions" → "bigquery-public-data.google_analytics_sample.ga_sessions_*"
+    """
+    import glob
+    base = BIGQUERY_DDL_DIR / db_name
+    if not base.exists():
+        return {}
+    result: dict[str, str] = {}
+    for json_file in glob.glob(str(base / "**" / "*.json"), recursive=True):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        fullname = d.get("table_fullname", "")
+        if not fullname or "." not in fullname:
+            continue
+        parts = fullname.split(".")
+        last = parts[-1]
+        # Detect date-suffix partitions: events_20170120 -> events_*, ga_sessions_201707 -> ga_sessions_*
+        m = re.match(r"^(.+?)_(\d{4,8}(?:_q\d)?)$", last, re.IGNORECASE)
+        if m:
+            short = m.group(1)
+            wildcard_full = ".".join(parts[:-1]) + "." + short + "_*"
+        else:
+            short = last
+            wildcard_full = fullname
+        # First-write-wins (avoid date-collision overwrites with non-wildcard)
+        result.setdefault(short, wildcard_full)
+    return result
+
+
+def load_sample_rows_from_json(db_name: str, platform: str) -> dict[str, dict[str, list]]:
+    """Load pre-computed sample_rows from per-table JSON files.
+
+    Returns: {table_fullname: {col_name: [sample_values]}}
+    Useful for Snowflake/BigQuery to avoid live queries during VectorStore build.
+    """
+    import glob
+    if platform == "snowflake":
+        base = SNOWFLAKE_DDL_DIR / db_name
+    elif platform == "bigquery":
+        base = BIGQUERY_DDL_DIR / db_name
+    else:
+        return {}
+
+    result: dict[str, dict[str, list]] = {}
+    for json_file in glob.glob(str(base / "**" / "*.json"), recursive=True):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        tname = d.get("table_fullname") or d.get("table_name")
+        if not tname:
+            continue
+        sample_rows = d.get("sample_rows", [])
+        if not sample_rows:
+            continue
+        col_values: dict[str, list] = {}
+        for row in sample_rows:
+            for col_name, val in row.items():
+                col_values.setdefault(col_name, []).append(val)
+        result[tname] = col_values
+        # Also store under short name
+        short = tname.rsplit(".", 1)[-1] if "." in tname else tname
+        if short != tname and short not in result:
+            result[short] = col_values
+    return result
 
 
 def _dedup_bq_tables(tables: dict[str, dict]) -> dict[str, dict]:
