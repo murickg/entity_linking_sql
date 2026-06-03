@@ -103,31 +103,51 @@ def generate_descriptions_for_table(
         return {}
 
 
+class DescriptionLimitExceeded(Exception):
+    """Raised when the number of missing column descriptions exceeds the configured limit."""
+    def __init__(self, missing: int, limit: int, db_name: str):
+        self.missing = missing
+        self.limit = limit
+        self.db_name = db_name
+        super().__init__(
+            f"DB '{db_name}' has {missing} columns without cached descriptions "
+            f"(limit={limit}). Skipping to save time/tokens."
+        )
+
+
 def generate_all_descriptions(
     db_name: str,
     documents: list,  # list[ColumnDocument]
+    max_missing: int | None = None,
 ) -> dict[str, str]:
     """Generate LLM descriptions for all columns in a database, with caching.
 
     Args:
         db_name: Database name (used for cache key).
         documents: List of ColumnDocument objects (already profiled).
+        max_missing: If set, raise DescriptionLimitExceeded when missing-from-cache count > max_missing.
 
     Returns: {table.column: description} dict.
     """
     cache_path = DESCRIPTION_CACHE_DIR / f"{db_name}.json"
+    current_keys = {f"{d.table_name}.{d.column_name}" for d in documents}
 
     # Check cache
+    cached: dict[str, str] = {}
     if cache_path.exists():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
             # Validate: all current columns should be in cache
-            current_keys = {f"{d.table_name}.{d.column_name}" for d in documents}
             if current_keys.issubset(set(cached.keys())):
                 return cached
         except (json.JSONDecodeError, Exception):
-            pass
+            cached = {}
+
+    # Check missing count before kicking off generation
+    missing_keys = current_keys - set(cached.keys())
+    if max_missing is not None and len(missing_keys) > max_missing:
+        raise DescriptionLimitExceeded(len(missing_keys), max_missing, db_name)
 
     # Group documents by table
     tables: dict[str, list[dict]] = {}

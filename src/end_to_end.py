@@ -58,6 +58,7 @@ def evaluate_one_instance(
     use_pipeline: bool = False,
     num_candidates: int = 5,
     platform: str = "sqlite",
+    max_missing_descriptions: int | None = None,
 ) -> dict:
     """Evaluate one instance across all chosen approaches."""
     instance_id = instance["instance_id"]
@@ -151,11 +152,18 @@ def evaluate_one_instance(
                 continue
 
         elif approach == "ours":
-            vs = get_vector_store(
-                db_name, ddl_data,
-                sqlite_path=sqlite_path,
-                external_samples=external_samples,
-            )
+            from src.column_describer import DescriptionLimitExceeded
+            try:
+                vs = get_vector_store(
+                    db_name, ddl_data,
+                    sqlite_path=sqlite_path,
+                    external_samples=external_samples,
+                    max_missing_descriptions=max_missing_descriptions,
+                )
+            except DescriptionLimitExceeded as e:
+                result["error"] = f"skipped: {e}"
+                record["approaches"][approach] = result
+                continue
             agent_result = run_autolink_agent(
                 question=instance["question"],
                 db_name=db_name,
@@ -263,6 +271,7 @@ def run_end_to_end(
     num_candidates: int = 5,
     platform: str = "sqlite",
     instance_ids: list[str] | None = None,
+    max_missing_descriptions: int | None = None,
 ):
     """Main entry: orchestrate all approaches × all instances.
 
@@ -342,6 +351,7 @@ def run_end_to_end(
                 use_pipeline=use_pipeline,
                 num_candidates=num_candidates,
                 platform=platform,
+                max_missing_descriptions=max_missing_descriptions,
             )
         except Exception as e:
             record = {
@@ -434,6 +444,9 @@ if __name__ == "__main__":
                         choices=["sqlite", "snowflake", "bigquery"])
     parser.add_argument("--instances", nargs="+", default=None,
                         help="Run only specific instances by ID, e.g. --instances bq042 bq119 local019")
+    parser.add_argument("--max-missing-descriptions", type=int, default=None,
+                        help="Skip instance if its DB needs more than N fresh LLM column descriptions "
+                             "(saves time/tokens on huge schemas). Only applies to 'ours' approach.")
     args = parser.parse_args()
     run_end_to_end(
         approaches=args.approaches,
@@ -442,4 +455,5 @@ if __name__ == "__main__":
         num_candidates=args.candidates,
         platform=args.platform,
         instance_ids=args.instances,
+        max_missing_descriptions=args.max_missing_descriptions,
     )

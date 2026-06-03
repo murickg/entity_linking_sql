@@ -326,8 +326,10 @@ def generate_sql(
     temperature: float = 0.0,
     platform: str = "sqlite",
     model: str | None = None,
+    max_retries: int = 3,
 ) -> dict:
-    """Generate one SQL candidate for a question."""
+    """Generate one SQL candidate for a question. Retries on empty / failed responses."""
+    import time, random
     dialect, opt_block = _dialect_opts(platform)
     full_schema = schema_prompt
     if external_knowledge:
@@ -340,36 +342,50 @@ def generate_sql(
         DIALECT_OPTIMIZATION=opt_block,
     )
 
-    try:
-        response = _client().chat.completions.create(
-            model=model or SQL_GEN_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-        )
-        msg = response.choices[0].message
-        raw = msg.content or ""
-        # For DeepSeek-R1: if `content` is empty, try `reasoning_content`
-        if not raw:
-            raw = getattr(msg, "reasoning_content", None) or ""
-            if raw:
-                print(f"  [INFO] Falling back to reasoning_content ({len(raw)} chars)")
-        sql = extract_sql(raw)
-        if not sql:
-            print(f"  [WARN] Empty SQL extracted. Raw response length: {len(raw)}")
-            print(f"  [WARN] Raw preview: {raw[:500]}")
-        tokens = {
-            "prompt": response.usage.prompt_tokens if response.usage else 0,
-            "completion": response.usage.completion_tokens if response.usage else 0,
-        }
-        tokens["total"] = tokens["prompt"] + tokens["completion"]
-        return {"sql": sql, "raw_response": raw, "tokens": tokens, "error": None}
-    except Exception as e:
-        return {
-            "sql": "",
-            "raw_response": "",
-            "tokens": {"prompt": 0, "completion": 0, "total": 0},
-            "error": str(e),
-        }
+    last_err = None
+    accum_tokens = {"prompt": 0, "completion": 0, "total": 0}
+    for attempt in range(max_retries):
+        try:
+            response = _client().chat.completions.create(
+                model=model or SQL_GEN_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+            )
+            msg = response.choices[0].message
+            raw = msg.content or ""
+            # DeepSeek-R1: if `content` empty, try `reasoning_content`
+            if not raw:
+                raw = getattr(msg, "reasoning_content", None) or ""
+            # Accumulate tokens even on failed attempts
+            if response.usage:
+                accum_tokens["prompt"] += response.usage.prompt_tokens
+                accum_tokens["completion"] += response.usage.completion_tokens
+            sql = extract_sql(raw)
+            if sql:
+                accum_tokens["total"] = accum_tokens["prompt"] + accum_tokens["completion"]
+                return {"sql": sql, "raw_response": raw, "tokens": accum_tokens, "error": None}
+            # Empty SQL — retry with backoff
+            last_err = f"empty SQL (raw len={len(raw)})"
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                print(f"  [RETRY {attempt+1}/{max_retries}] empty response, waiting {wait:.1f}s")
+                time.sleep(wait)
+        except Exception as e:
+            last_err = str(e)
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                print(f"  [RETRY {attempt+1}/{max_retries}] {e!s:.100} — waiting {wait:.1f}s")
+                time.sleep(wait)
+
+    # All retries exhausted
+    print(f"  [WARN] generate_sql failed after {max_retries} attempts. Last error: {last_err}")
+    accum_tokens["total"] = accum_tokens["prompt"] + accum_tokens["completion"]
+    return {
+        "sql": "",
+        "raw_response": "",
+        "tokens": accum_tokens,
+        "error": last_err,
+    }
 
 
 # ===========================================================================
@@ -399,26 +415,41 @@ def revise_sql(
         DIALECT_OPTIMIZATION=opt_block,
     )
 
-    try:
-        response = _client().chat.completions.create(
-            model=SQL_GEN_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-        )
-        msg = response.choices[0].message
-        raw = msg.content or ""
-        if not raw:
-            raw = getattr(msg, "reasoning_content", None) or ""
-        sql = extract_sql(raw)
-        tokens = {
-            "prompt": response.usage.prompt_tokens if response.usage else 0,
-            "completion": response.usage.completion_tokens if response.usage else 0,
-        }
-        tokens["total"] = tokens["prompt"] + tokens["completion"]
-        return {"sql": sql, "tokens": tokens, "error": None}
-    except Exception as e:
-        return {"sql": "", "tokens": {"prompt": 0, "completion": 0, "total": 0},
-                "error": str(e)}
+    import time, random
+    last_err = None
+    accum_tokens = {"prompt": 0, "completion": 0, "total": 0}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = _client().chat.completions.create(
+                model=SQL_GEN_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            msg = response.choices[0].message
+            raw = msg.content or ""
+            if not raw:
+                raw = getattr(msg, "reasoning_content", None) or ""
+            if response.usage:
+                accum_tokens["prompt"] += response.usage.prompt_tokens
+                accum_tokens["completion"] += response.usage.completion_tokens
+            sql = extract_sql(raw)
+            if sql:
+                accum_tokens["total"] = accum_tokens["prompt"] + accum_tokens["completion"]
+                return {"sql": sql, "tokens": accum_tokens, "error": None}
+            last_err = f"empty SQL (raw len={len(raw)})"
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                print(f"  [REVISE RETRY {attempt+1}/{max_retries}] empty, waiting {wait:.1f}s")
+                time.sleep(wait)
+        except Exception as e:
+            last_err = str(e)
+            if attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1.5)
+                print(f"  [REVISE RETRY {attempt+1}/{max_retries}] {e!s:.100} — waiting {wait:.1f}s")
+                time.sleep(wait)
+    accum_tokens["total"] = accum_tokens["prompt"] + accum_tokens["completion"]
+    return {"sql": "", "tokens": accum_tokens, "error": last_err}
 
 
 # ===========================================================================
@@ -563,17 +594,26 @@ def run_sql_pipeline(
             return _execute_bigquery(sql, bq_executor)
         return _execute_sql(sqlite_path, sql)
 
+    from concurrent.futures import ThreadPoolExecutor
+
     total_tokens = {"prompt": 0, "completion": 0, "total": 0}
-    candidates: list[dict] = []
 
     # Use varied temperatures across candidates for diversity
     temps = [0.0, 0.3, 0.5, 0.7, 0.9]
-    for i in range(num_candidates):
+
+    def _process_candidate(i: int) -> tuple[dict, dict]:
+        """Generate one candidate (+ optional revise loop). Returns (candidate, tokens)."""
+        import time as _t
         temp = temps[i % len(temps)]
+        print(f"  [cand {i} T={temp}] gen start", flush=True)
+        _t0 = _t.time()
         gen = generate_sql(question, schema_prompt, external_knowledge,
                            temperature=temp, platform=platform)
-        total_tokens["prompt"] += gen["tokens"]["prompt"]
-        total_tokens["completion"] += gen["tokens"]["completion"]
+        print(f"  [cand {i} T={temp}] gen done in {_t.time()-_t0:.1f}s  sql_len={len(gen.get('sql') or '')}", flush=True)
+        local_toks = {
+            "prompt": gen["tokens"]["prompt"],
+            "completion": gen["tokens"]["completion"],
+        }
 
         rows, err = _run(gen["sql"]) if gen["sql"] else ([], "no sql")
         candidate = {
@@ -584,13 +624,16 @@ def run_sql_pipeline(
             "revised": False,
         }
 
-        # Revise loop
+        if err:
+            print(f"  [cand {i}] exec err: {str(err)[:120]}", flush=True)
+        # Revise loop (sequential within a candidate)
         revs = 0
         while err and revs < max_revisions and gen["sql"]:
+            print(f"  [cand {i}] revise {revs+1}/{max_revisions}", flush=True)
             rev = revise_sql(question, schema_prompt, gen["sql"], err,
                              external_knowledge, platform=platform)
-            total_tokens["prompt"] += rev["tokens"]["prompt"]
-            total_tokens["completion"] += rev["tokens"]["completion"]
+            local_toks["prompt"] += rev["tokens"]["prompt"]
+            local_toks["completion"] += rev["tokens"]["completion"]
             if rev["error"] or not rev["sql"]:
                 break
             gen["sql"] = rev["sql"]
@@ -601,7 +644,19 @@ def run_sql_pipeline(
             candidate["revised"] = True
             revs += 1
 
-        candidates.append(candidate)
+        return candidate, local_toks
+
+    # Parallelize candidate generation (each is I/O-bound on LLM API)
+    candidates: list[dict] = [None] * num_candidates  # type: ignore
+    with ThreadPoolExecutor(max_workers=num_candidates) as executor:
+        futures = {executor.submit(_process_candidate, i): i
+                   for i in range(num_candidates)}
+        for fut in futures:
+            i = futures[fut]
+            cand, toks = fut.result()
+            candidates[i] = cand
+            total_tokens["prompt"] += toks["prompt"]
+            total_tokens["completion"] += toks["completion"]
 
     total_tokens["total"] = total_tokens["prompt"] + total_tokens["completion"]
 

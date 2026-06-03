@@ -81,6 +81,7 @@ class VectorStore:
         ddl_data: dict[str, dict],
         sqlite_path: Path | None = None,
         external_samples: dict[str, dict[str, list]] | None = None,
+        max_missing_descriptions: int | None = None,
     ) -> None:
         """Build column documents from DDL metadata + profiling stats + sample values.
 
@@ -187,7 +188,7 @@ class VectorStore:
                 self.documents.append(doc)
 
         # Generate LLM descriptions (cached per db)
-        self._apply_llm_descriptions()
+        self._apply_llm_descriptions(max_missing=max_missing_descriptions)
 
         # Build embeddings
         self._build_embeddings()
@@ -207,11 +208,17 @@ class VectorStore:
             self._tokenized_docs.append(_tokenize(text))
         self._bm25 = BM25Okapi(self._tokenized_docs)
 
-    def _apply_llm_descriptions(self) -> None:
-        """Generate and apply LLM descriptions to column documents."""
+    def _apply_llm_descriptions(self, max_missing: int | None = None) -> None:
+        """Generate and apply LLM descriptions to column documents.
+
+        If max_missing is set and the number of columns not yet cached exceeds it,
+        DescriptionLimitExceeded propagates up so the caller can skip the instance.
+        """
         if not self.documents:
             return
-        descriptions = generate_all_descriptions(self.db_name, self.documents)
+        descriptions = generate_all_descriptions(
+            self.db_name, self.documents, max_missing=max_missing,
+        )
         applied = 0
         for doc in self.documents:
             key = f"{doc.table_name}.{doc.column_name}"
@@ -329,11 +336,21 @@ def get_vector_store(
     ddl_data: dict,
     sqlite_path: Path | None = None,
     external_samples: dict | None = None,
+    max_missing_descriptions: int | None = None,
 ) -> VectorStore:
-    """Get or build a cached VectorStore."""
+    """Get or build a cached VectorStore.
+
+    If max_missing_descriptions is set and the database needs more than that many
+    fresh LLM descriptions, DescriptionLimitExceeded propagates up.
+    """
     if db_name not in _vs_cache:
         vs = VectorStore(db_name=db_name)
-        vs.build(ddl_data, sqlite_path=sqlite_path, external_samples=external_samples)
+        vs.build(
+            ddl_data,
+            sqlite_path=sqlite_path,
+            external_samples=external_samples,
+            max_missing_descriptions=max_missing_descriptions,
+        )
         _vs_cache[db_name] = vs
     else:
         _vs_cache[db_name].reset_excluded()
